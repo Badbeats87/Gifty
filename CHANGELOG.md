@@ -53,4 +53,14 @@ All notable changes to **Gifty** are documented here.
 - Stripe onboarding URL errors by removing/adjusting `business_profile.url`.
 - Node.js version issues (moved to Node 22).
 
----
+## [2025-09-04] Fulfillment Fixes
+### Added
+- Order + gift card creation logic aligned with DB schema (`orders`, `gift_cards`).
+- Idempotent fulfillment (no duplicate gift cards per session).
+- Detailed error messages returned from `/api/checkout/fulfill`.
+
+### Fixed
+- `Invalid amount` errors from mismatch between client and API.
+- 404 redirect after checkout (now routes back to `/b/[slug]?session_id=...`).
+- Gift card insert errors (now uses `*_amount_cents`, `order_id`, `status`).
+- Emails now send to recipient + buyer correctly.
