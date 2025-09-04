@@ -14,10 +14,12 @@ export default async function BusinessPage({ params, searchParams }: Props) {
 
   if (error) {
     return (
-      <div className="p-6">
-        <h1 className="text-2xl font-bold">Error</h1>
+      <div className="max-w-2xl mx-auto p-6">
+        <h1 className="text-2xl font-semibold mb-2">Error</h1>
         <p className="text-red-600">{error.message}</p>
-        <Link href="/" className="underline">Go home</Link>
+        <p className="mt-4">
+          <Link href="/" className="underline">Go back</Link>
+        </p>
       </div>
     );
   }
@@ -25,48 +27,39 @@ export default async function BusinessPage({ params, searchParams }: Props) {
   const biz = Array.isArray(data) ? data[0] : data;
   if (!biz) {
     return (
-      <div className="p-6">
-        <h1 className="text-2xl font-bold">Not found</h1>
-        <p>No business with slug “{params.slug}”.</p>
-        <Link href="/" className="underline">Go home</Link>
+      <div className="max-w-2xl mx-auto p-6">
+        <h1 className="text-2xl font-semibold mb-2">Not found</h1>
+        <p className="text-gray-600">This business doesn’t exist.</p>
+        <p className="mt-4">
+          <Link href="/" className="underline">Go back</Link>
+        </p>
       </div>
     );
   }
 
-  const success = searchParams?.success === '1';
-  const canceled = searchParams?.canceled === '1';
-  const sessionId = typeof searchParams?.session_id === 'string' ? searchParams.session_id : undefined;
+  const successCode = typeof searchParams?.code === 'string' ? searchParams?.code : undefined;
 
   return (
-    <div className="max-w-3xl mx-auto p-6 space-y-6">
-      <header className="flex items-center gap-4">
-        {biz.logo_url ? (
+    <div className="max-w-2xl mx-auto p-6 space-y-6">
+      <header className="space-y-2">
+        {biz.logo_url && (
           // eslint-disable-next-line @next/next/no-img-element
-          <img src={biz.logo_url} alt={`${biz.name} logo`} className="h-12 w-12 rounded-xl object-cover" />
-        ) : (
-          <div className="h-12 w-12 rounded-xl bg-gray-200" />
+          <img src={biz.logo_url} alt={`${biz.name} logo`} className="h-14 w-14 rounded-lg" />
         )}
-        <div>
-          <h1 className="text-3xl font-bold">{biz.name}</h1>
-          <p className="text-gray-600">Gift cards by {biz.name}</p>
-        </div>
+        <h1 className="text-2xl font-bold">{biz.name}</h1>
+        <p className="text-sm text-gray-500">Gift cards by {biz.name}</p>
       </header>
 
-      {success && (
-        <div className="rounded-lg border p-3 bg-green-50 space-y-2">
-          <p>Payment succeeded! We’re issuing your gift card…</p>
-          {sessionId && <PurchaseSuccess sessionId={sessionId} />}
-        </div>
-      )}
-      {canceled && (
-        <div className="rounded-lg border p-3 bg-yellow-50">
-          <p>Payment canceled.</p>
+      {successCode && (
+        <div className="rounded-2xl border p-4 bg-green-50">
+          <PurchaseSuccess code={successCode} />
         </div>
       )}
 
       <section className="rounded-2xl border p-4 space-y-3">
         <h2 className="text-xl font-semibold">Buy a gift card</h2>
-        <ClientBuyForm slug={biz.slug} businessName={biz.name} />
+        {/* 👇 pass businessId down so the client can call the API with the correct key */}
+        <ClientBuyForm slug={biz.slug} businessName={biz.name} businessId={biz.id} />
       </section>
 
       <footer className="text-sm text-gray-500">

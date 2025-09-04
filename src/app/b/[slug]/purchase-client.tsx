@@ -2,75 +2,117 @@
 
 import { useState } from 'react';
 
-export default function ClientBuyForm({ slug, businessName }: { slug: string; businessName: string }) {
+export default function ClientBuyForm({
+  slug,
+  businessName,
+  businessId,
+}: {
+  slug: string;
+  businessName: string;
+  businessId: string;
+}) {
   const [amount, setAmount] = useState<number>(25);
   const [buyerEmail, setBuyerEmail] = useState<string>('');
   const [recipientEmail, setRecipientEmail] = useState<string>('');
+  const [giftMessage, setGiftMessage] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
 
   async function startCheckout(e: React.FormEvent) {
     e.preventDefault();
     setMsg(null);
+
+    // quick client-side guardrails
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      setMsg('Please enter a valid amount.');
+      return;
+    }
+    if (!buyerEmail) {
+      setMsg('Please enter your email.');
+      return;
+    }
+
     setLoading(true);
     try {
+      // IMPORTANT: send the keys the API expects
       const res = await fetch('/api/checkout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          slug,
-          amountCents: Math.round(Number(amount) * 100),
-          buyerEmail: buyerEmail || undefined,
+          businessId,
+          amountUsd: amt,
+          buyerEmail,
           recipientEmail: recipientEmail || undefined,
+          giftMessage: giftMessage || undefined,
+          // slug is still available if your API wants to log it, but not required
+          slug,
         }),
       });
+
       const json = await res.json();
       if (!res.ok) {
-        setMsg(json.error || 'Failed to start checkout');
-        setLoading(false);
+        setMsg(json?.error || 'Something went wrong.');
         return;
       }
-      window.location.href = json.url;
+
+      // redirect to Stripe Checkout
+      if (json?.url) {
+        window.location.href = json.url as string;
+        return;
+      }
+      setMsg('Unexpected response from checkout.');
     } catch (err: any) {
-      setMsg(err.message || 'Something went wrong');
+      setMsg(err?.message || 'Network error.');
+    } finally {
       setLoading(false);
     }
   }
 
   return (
-    <form onSubmit={startCheckout} className="grid gap-3 max-w-md">
-      <label className="grid gap-1">
-        <span className="text-sm text-gray-600">Amount (USD)</span>
+    <form onSubmit={startCheckout} className="space-y-4">
+      <label className="block space-y-2">
+        <span className="text-sm font-medium">Amount (USD)</span>
         <input
           type="number"
           min={1}
-          step="1"
+          step={1}
           value={amount}
-          onChange={(e) => setAmount(e.target.valueAsNumber || 0)}
-          className="border rounded-lg p-3"
-          required
+          onChange={(e) => setAmount(Number(e.target.value))}
+          className="border rounded-lg p-3 w-full"
         />
       </label>
 
-      <label className="grid gap-1">
-        <span className="text-sm text-gray-600">Your email (for receipt)</span>
+      <label className="block space-y-2">
+        <span className="text-sm font-medium">Your email (for receipt)</span>
         <input
           type="email"
           value={buyerEmail}
           onChange={(e) => setBuyerEmail(e.target.value)}
-          className="border rounded-lg p-3"
+          className="border rounded-lg p-3 w-full"
           placeholder="you@example.com"
         />
       </label>
 
-      <label className="grid gap-1">
-        <span className="text-sm text-gray-600">Recipient email (optional)</span>
+      <label className="block space-y-2">
+        <span className="text-sm font-medium">Recipient email (optional)</span>
         <input
           type="email"
           value={recipientEmail}
           onChange={(e) => setRecipientEmail(e.target.value)}
-          className="border rounded-lg p-3"
+          className="border rounded-lg p-3 w-full"
           placeholder="friend@example.com"
+        />
+      </label>
+
+      <label className="block space-y-2">
+        <span className="text-sm font-medium">Message (optional)</span>
+        <input
+          type="text"
+          value={giftMessage}
+          onChange={(e) => setGiftMessage(e.target.value)}
+          className="border rounded-lg p-3 w-full"
+          placeholder="Enjoy!"
         />
       </label>
 
