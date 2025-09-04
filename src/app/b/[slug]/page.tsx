@@ -37,7 +37,9 @@ export default async function BusinessPage({ params, searchParams }: Props) {
     );
   }
 
-  const successCode = typeof searchParams?.code === 'string' ? searchParams?.code : undefined;
+  // 👇 Stripe redirect sends ?session_id=cs_test_...
+  const sessionId =
+    typeof searchParams?.session_id === 'string' ? searchParams.session_id : undefined;
 
   return (
     <div className="max-w-2xl mx-auto p-6 space-y-6">
@@ -50,15 +52,15 @@ export default async function BusinessPage({ params, searchParams }: Props) {
         <p className="text-sm text-gray-500">Gift cards by {biz.name}</p>
       </header>
 
-      {successCode && (
+      {sessionId && (
         <div className="rounded-2xl border p-4 bg-green-50">
-          <PurchaseSuccess code={successCode} />
+          {/* 👇 This component will POST to /api/checkout/fulfill with the sessionId */}
+          <PurchaseSuccess sessionId={sessionId} />
         </div>
       )}
 
       <section className="rounded-2xl border p-4 space-y-3">
         <h2 className="text-xl font-semibold">Buy a gift card</h2>
-        {/* 👇 pass businessId down so the client can call the API with the correct key */}
         <ClientBuyForm slug={biz.slug} businessName={biz.name} businessId={biz.id} />
       </section>
 
