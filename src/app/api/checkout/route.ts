@@ -1,128 +1,99 @@
 // src/app/api/checkout/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { stripe } from "@/lib/stripe";
-import { computeFees } from "@/lib/fees";
-import {
-  getBusinessById,
-  getBusinessBySlug,
-  recordCheckoutIntent,
-} from "@/lib/db";
+import { computeApplicationFee } from "@/lib/fees";
+import { getCommissionOverrideBySlug, supabaseAdmin } from "@/lib/db";
 
-type Body =
-  | {
-      business_id?: string;
-      business_slug?: string;
-      amountUsd?: number | string;
-      buyerEmail?: string;
-      recipientEmail?: string;
-    }
-  | undefined;
-
-const APP_URL = process.env.NEXT_PUBLIC_APP_URL;
-if (!APP_URL) {
-  throw new Error("NEXT_PUBLIC_APP_URL not set");
-}
-
-function parseAmountCents(amountUsd: number | string | undefined) {
-  if (amountUsd === undefined || amountUsd === null || amountUsd === "") {
-    throw new Error("Missing field: amountUsd");
-  }
-  const asNumber =
-    typeof amountUsd === "string" ? Number(amountUsd) : Number(amountUsd);
-  if (!Number.isFinite(asNumber)) throw new Error("Invalid amount");
-  // Allow decimals like 25.50
-  const cents = Math.round(asNumber * 100);
-  if (cents <= 0) throw new Error("Invalid amount");
-  return cents;
-}
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
   try {
-    const json = (await req.json()) as Body;
+    const body = await req.json().catch(() => ({}));
+    const amount = Math.max(100, Math.floor(+body.amount_cents || 0)); // min $1
+    const buyer_email = String(body.buyer_email || "");
+    const recipient_email = body.recipient_email ? String(body.recipient_email) : null;
+    const message = body.message ? String(body.message) : undefined;
 
-    const businessId = json?.business_id;
-    const businessSlug = json?.business_slug;
-    const buyerEmail = json?.buyerEmail;
-    const recipientEmail = json?.recipientEmail ?? null;
-
-    if (!buyerEmail) {
-      return NextResponse.json(
-        { error: "Missing field: buyerEmail" },
-        { status: 400 }
-      );
+    // business identification
+    const business_id = body.business_id ? String(body.business_id) : null;
+    const business_slug = body.business_slug ? String(body.business_slug).toLowerCase() : null;
+    if (!business_id && !business_slug) {
+      return NextResponse.json({ error: "Unknown business (provide business_id or business_slug)" }, { status: 400 });
     }
 
-    // Resolve business
-    let business =
-      (businessId ? await getBusinessById(businessId) : null) ??
-      (businessSlug ? await getBusinessBySlug(businessSlug) : null);
+    // override lookup (optional)
+    const override = business_slug ? await getCommissionOverrideBySlug(business_slug) : null;
 
-    if (!business) {
-      return NextResponse.json(
-        { error: "Unknown business (provide business_id or business_slug)" },
-        { status: 400 }
-      );
+    // compute fee
+    const application_fee_amount = computeApplicationFee(amount, override || undefined);
+
+    // destination account: per-business override wins; else fallback to env
+    const destination =
+      override?.stripe_account_id ||
+      process.env.DEV_STRIPE_CONNECTED_ACCOUNT_ID ||
+      process.env.STRIPE_CONNECTED_ACCOUNT_ID;
+
+    if (!destination) {
+      return NextResponse.json({ error: "Missing destination connected account id" }, { status: 500 });
     }
 
-    if (!business.stripe_account_id) {
-      return NextResponse.json(
-        { error: "Business is not connected to Stripe yet." },
-        { status: 400 }
-      );
-    }
-
-    const amountCents = parseAmountCents(json?.amountUsd);
-    const { applicationFeeAmount } = computeFees(amountCents);
-
+    // create checkout session (destination charges with application fee)
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      allow_promotion_codes: true,
+      success_url: `${process.env.NEXT_PUBLIC_APP_URL}/b/${business_slug || "success"}/purchase-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.NEXT_PUBLIC_APP_URL}/b/${business_slug || ""}`,
+      customer_email: buyer_email || undefined,
       line_items: [
         {
           price_data: {
             currency: "usd",
             product_data: {
-              name: `${business.name} – Gift Card`,
+              name: `${(business_slug || "Gift")} gift card`,
             },
-            unit_amount: amountCents,
+            unit_amount: amount,
           },
           quantity: 1,
         },
       ],
-      success_url: `${APP_URL}/b/${business.slug}/purchase-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${APP_URL}/b/${business.slug}`,
-      customer_email: buyerEmail,
-      metadata: {
-        business_id: business.id,
-        business_slug: business.slug,
-        buyer_email: buyerEmail,
-        recipient_email: recipientEmail ?? "",
-      },
       payment_intent_data: {
-        application_fee_amount: applicationFeeAmount,
+        application_fee_amount,
         transfer_data: {
-          destination: business.stripe_account_id,
+          destination,
         },
+        metadata: {
+          business_id: business_id || "",
+          business_slug: business_slug || "",
+          business_name: business_slug ? business_slug.replace(/-/g, " ") : "",
+          buyer_email,
+          recipient_email: recipient_email || "",
+          message: message || "",
+        },
+      },
+      metadata: {
+        business_id: business_id || "",
+        business_slug: business_slug || "",
+        business_name: business_slug ? business_slug.replace(/-/g, " ") : "",
+        buyer_email,
+        recipient_email: recipient_email || "",
+        message: message || "",
       },
     });
 
-    // Optional: record a local intent (best effort)
+    // (best-effort) log checkout intent (optional)
     try {
-      await recordCheckoutIntent({
-        business_id: business.id,
-        amount_cents: amountCents,
-        buyer_email: buyerEmail,
-        recipient_email: recipientEmail,
+      await supabaseAdmin.from("checkouts").insert({
+        business_id,
+        amount_cents: amount,
+        buyer_email,
+        recipient_email,
+        status: "created",
         stripe_checkout_id: session.id,
-      });
-    } catch (e) {
-      console.warn("[checkout] recordCheckoutIntent failed:", e);
-    }
+      } as any);
+    } catch (_) {}
 
-    return NextResponse.json({ id: session.id, url: session.url }, { status: 200 });
-  } catch (err: any) {
-    const message =
-      typeof err?.message === "string" ? err.message : "Unexpected error";
-    return NextResponse.json({ error: message }, { status: 400 });
+    return NextResponse.json({ url: session.url }, { status: 200 });
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || "Checkout error" }, { status: 500 });
   }
 }
