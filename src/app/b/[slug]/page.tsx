@@ -1,73 +1,97 @@
 // src/app/b/[slug]/page.tsx
-import PurchaseClient from "./purchase-client";
-import { supabaseServer } from "@/lib/supabase";
+import Link from "next/link";
+import { supabaseServer } from "@/lib/supabase-server";
+import BuyGiftForm from "./BuyGiftForm";
 
-type PageProps = {
-  // Next.js 15 makes these async to enable streaming
-  params: Promise<{ slug: string }>;
-  searchParams: Promise<Record<string, string | string[] | undefined>>;
+type Business = {
+  id: string;
+  name: string | null;
+  logo_url?: string | null;
 };
 
-export default async function BusinessPage({ params, searchParams }: PageProps) {
+export default async function BusinessPage({
+  params,
+}: {
+  params: Promise<{ slug: string }>;
+}) {
+  // Next 15: params is async in RSCs
   const { slug } = await params;
-  const _sp = await searchParams; // reserved for future use
 
-  const supabase = supabaseServer();
-  // If you don't have this RPC, you can remove it and just keep the fallback below.
-  const { data, error } = await supabase.rpc("get_business_public", {
-    p_slug: slug,
-  });
+  const supabase = await supabaseServer();
 
-  const business =
-    data ??
-    ({
-      name: slug.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
-      logo_url: null,
-    } as { name: string; logo_url?: string | null });
+  // Try to load by ID first (home links by ID), then fall back to slug (if present)
+  async function fetchBusiness(): Promise<{ data: Business | null; error?: any }> {
+    // by ID
+    let res = await supabase
+      .from("businesses")
+      .select("id, name, logo_url")
+      .eq("id", slug)
+      .single();
+
+    if (!res.error && res.data) return { data: res.data as Business };
+
+    // by slug (if the column exists)
+    const bySlug = await supabase
+      .from("businesses")
+      .select("id, name, logo_url")
+      .eq("slug", slug)
+      .single();
+
+    if (!bySlug.error && bySlug.data) return { data: bySlug.data as Business };
+
+    return { data: null, error: bySlug.error ?? res.error };
+  }
+
+  const { data: business, error } = await fetchBusiness();
+
+  if (!business) {
+    return (
+      <main className="mx-auto max-w-3xl p-6">
+        <Link href="/" className="underline">
+          ← Back
+        </Link>
+        <h1 className="mt-4 text-2xl font-semibold">Business not found</h1>
+        <p className="mt-2 text-gray-700">
+          We couldn’t find a business for{" "}
+          <code className="px-1 py-0.5 rounded bg-gray-100">{slug}</code>.
+        </p>
+        {error ? (
+          <p className="mt-2 text-sm text-gray-500">
+            Details: {error.message ?? String(error)}
+          </p>
+        ) : null}
+        <p className="mt-6">
+          <Link href="/" className="underline">
+            Back to home
+          </Link>
+        </p>
+      </main>
+    );
+  }
 
   return (
-    <div className="mx-auto max-w-3xl p-6">
-      <a href="/" className="text-sm text-gray-600 hover:underline">
+    <main className="mx-auto max-w-3xl p-6">
+      <Link href="/" className="underline">
         ← Back
-      </a>
+      </Link>
 
-      <div className="mt-6 flex items-center gap-4">
+      <header className="mt-4 mb-6">
+        <h1 className="text-2xl font-semibold">{business.name ?? "Business"}</h1>
         {business.logo_url ? (
-          // eslint-disable-next-line @next/next/no-img-element
+          // use <img> to avoid next/image domain config during setup
           <img
-            alt={`${business.name} logo`}
             src={business.logo_url}
-            className="h-12 w-12 rounded"
+            alt={`${business.name ?? "Business"} logo`}
+            width={96}
+            height={96}
+            className="rounded mt-3"
           />
-        ) : (
-          <div className="flex h-12 w-12 items-center justify-center rounded bg-gray-200 text-sm">
-            {business.name?.charAt(0)?.toUpperCase() ?? "?"}
-          </div>
-        )}
+        ) : null}
+      </header>
 
-        <div>
-          <h1 className="text-2xl font-semibold">{business.name}</h1>
-          <p className="text-sm text-gray-600">Gift cards by {business.name}</p>
-        </div>
-      </div>
-
-      <div className="mt-8">
-        <h2 className="mb-2 text-lg font-medium">Buy a gift card</h2>
-        <PurchaseClient businessSlug={slug} businessName={business.name} />
-      </div>
-
-      {error ? (
-        <div className="mt-6 rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
-          Could not load business from database (using fallback). You can seed
-          it later; this won’t block test purchases.
-        </div>
-      ) : null}
-
-      <div className="mt-10 text-xs text-gray-500">
-        Merchant dashboard
-        <br />
-        © {new Date().getFullYear()} Gifty — Send gifts, not remittances.
-      </div>
-    </div>
+      <section className="mt-6">
+        <BuyGiftForm businessId={business.id} businessName={business.name ?? "Business"} />
+      </section>
+    </main>
   );
 }

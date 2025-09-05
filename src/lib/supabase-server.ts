@@ -1,23 +1,36 @@
 // src/lib/supabase-server.ts
-import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
+import { createServerClient } from "@supabase/ssr";
 
-const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-
-/** Server-side helper (reads cookies; writes happen in API routes) */
+/**
+ * Server-side Supabase client for Server Components, Route Handlers, Actions.
+ *
+ * - In Server Components (RSC), Next.js 15 forbids cookie mutation.
+ *   So we implement read-only cookies: get() works; set/remove are NO-OPs.
+ * - In Route Handlers / Server Actions, cookie mutation is allowed, and
+ *   Supabase will still behave because it only needs mutations when rotating
+ *   sessions. If you ever need explicit writes there, we can add a separate
+ *   `supabaseServerMutable()` helper later.
+ */
 export async function supabaseServer() {
-  if (!url || !anon) throw new Error("Supabase env not configured");
-  const store = await cookies(); // Next 15: must await once
+  const cookieStore = await cookies();
 
-  return createServerClient(url, anon, {
-    cookies: {
-      get(name: string) {
-        return store.get(name)?.value;
+  return createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        get(name: string) {
+          return cookieStore.get(name)?.value;
+        },
+        // NO-OP in RSCs to comply with Next 15 rules.
+        set(_name: string, _value: string, _options: any) {
+          // intentionally empty: cookie writes are not allowed in Server Components
+        },
+        remove(_name: string, _options: any) {
+          // intentionally empty
+        },
       },
-      // SSG/Server Components can’t set headers here; writes are done in /api/auth/cookie
-      set() {},
-      remove() {},
-    },
-  });
+    }
+  );
 }

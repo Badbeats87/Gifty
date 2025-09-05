@@ -1,22 +1,24 @@
 // src/lib/fees.ts
-export type Commission = {
-  bps: number; // basis points (500 bps = 5%)
-  fixed_cents: number; // flat cents added
-};
+/**
+ * Compute the customer service fee and the merchant commission.
+ *
+ * Configure via env (defaults in parentheses):
+ * - SERVICE_FEE_PCT (0.06)         e.g. "0.06" for 6% (paid by customer)
+ * - MERCHANT_COMMISSION_PCT (0.10) e.g. "0.10" for 10% (deducted from business)
+ */
+export function computeFees(amountCents: number) {
+  const svcPct =
+    parseFloat(process.env.SERVICE_FEE_PCT ?? process.env.NEXT_PUBLIC_SERVICE_FEE_PCT ?? "") || 0.06;
+  const merchantPct =
+    parseFloat(process.env.MERCHANT_COMMISSION_PCT ?? "") || 0.10;
 
-export const DEFAULT_COMMISSION_BPS = 500; // 5%
-export const DEFAULT_COMMISSION_FIXED_CENTS = 50; // $0.50
+  const serviceFeeCents = Math.max(0, Math.round(amountCents * svcPct));
+  const merchantCommissionCents = Math.max(0, Math.round(amountCents * merchantPct));
+  const applicationFeeCents = serviceFeeCents + merchantCommissionCents;
 
-export function computeApplicationFee(amountCents: number, commission?: Partial<Commission>) {
-  const bps = Math.max(0, Math.floor(commission?.bps ?? DEFAULT_COMMISSION_BPS));
-  const fixed = Math.max(0, Math.floor(commission?.fixed_cents ?? DEFAULT_COMMISSION_FIXED_CENTS));
-  const pct = Math.round((amountCents * bps) / 10_000);
-  const fee = Math.max(0, pct + fixed);
-  return fee;
-}
-
-export function describeCommission(c?: Partial<Commission>) {
-  const bps = c?.bps ?? DEFAULT_COMMISSION_BPS;
-  const fixed = c?.fixed_cents ?? DEFAULT_COMMISSION_FIXED_CENTS;
-  return `${(bps / 100).toFixed(2)}% + ${(fixed / 100).toFixed(2)} ${"USD"}`;
+  return {
+    serviceFeeCents,
+    merchantCommissionCents,
+    applicationFeeCents,
+  };
 }

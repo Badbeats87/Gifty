@@ -1,99 +1,173 @@
 // src/app/api/checkout/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { stripe } from "@/lib/stripe";
-import { computeApplicationFee } from "@/lib/fees";
-import { getCommissionOverrideBySlug, supabaseAdmin } from "@/lib/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function POST(req: NextRequest) {
+/**
+ * Create a Stripe Checkout Session for buying a gift with Connect split.
+ * Body JSON:
+ * - business_id: string (required)
+ * - amountUsd: number (required, whole USD)
+ * - buyerEmail: string (required)
+ * - recipientEmail: string (optional)
+ *
+ * Flow:
+ *  - Customer pays gift + service fee.
+ *  - application_fee_amount = service fee + merchant commission.
+ *  - transfer_data.destination = merchant's Connect account.
+ */
+
+type Json = Record<string, any>;
+
+function computeFees(amountCents: number) {
+  const svcPct =
+    parseFloat(process.env.SERVICE_FEE_PCT ?? process.env.NEXT_PUBLIC_SERVICE_FEE_PCT ?? "") ||
+    0.06; // 6% default (customer)
+  const merchantPct = parseFloat(process.env.MERCHANT_COMMISSION_PCT ?? "") || 0.10; // 10% default (merchant)
+
+  const serviceFeeCents = Math.max(0, Math.round(amountCents * svcPct));
+  const merchantCommissionCents = Math.max(0, Math.round(amountCents * merchantPct));
+  const applicationFeeCents = serviceFeeCents + merchantCommissionCents;
+
+  return { serviceFeeCents, merchantCommissionCents, applicationFeeCents };
+}
+
+export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({}));
-    const amount = Math.max(100, Math.floor(+body.amount_cents || 0)); // min $1
-    const buyer_email = String(body.buyer_email || "");
-    const recipient_email = body.recipient_email ? String(body.recipient_email) : null;
-    const message = body.message ? String(body.message) : undefined;
+    const body: Json = await req.json().catch(() => ({} as Json));
 
-    // business identification
-    const business_id = body.business_id ? String(body.business_id) : null;
-    const business_slug = body.business_slug ? String(body.business_slug).toLowerCase() : null;
-    if (!business_id && !business_slug) {
-      return NextResponse.json({ error: "Unknown business (provide business_id or business_slug)" }, { status: 400 });
+    const business_id = String(body.business_id ?? "");
+    const amountUsd = Number(body.amountUsd ?? 0);
+    const buyerEmail = String(body.buyerEmail ?? "");
+    const recipientEmail =
+      typeof body.recipientEmail === "string" ? String(body.recipientEmail) : "";
+
+    if (!process.env.STRIPE_SECRET_KEY) {
+      return Response.json({ error: "Missing STRIPE_SECRET_KEY" }, { status: 500 });
+    }
+    if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      return Response.json(
+        { error: "Missing Supabase env (NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY)" },
+        { status: 500 }
+      );
+    }
+    if (!business_id || !Number.isFinite(amountUsd) || amountUsd <= 0 || !buyerEmail) {
+      return Response.json(
+        { error: "Missing fields: business_id, amountUsd (>0), buyerEmail are required." },
+        { status: 400 }
+      );
     }
 
-    // override lookup (optional)
-    const override = business_slug ? await getCommissionOverrideBySlug(business_slug) : null;
+    // --- Fetch the business via Supabase REST (service role) to get its Stripe Connect account ---
+    const restUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL!.replace(/\/$/, "")}/rest/v1/businesses`;
+    const restHeaders = {
+      apikey: process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY!}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+    };
 
-    // compute fee
-    const application_fee_amount = computeApplicationFee(amount, override || undefined);
+    const bizRes = await fetch(`${restUrl}?id=eq.${encodeURIComponent(business_id)}&select=*`, {
+      method: "GET",
+      headers: restHeaders,
+      cache: "no-store",
+    });
 
-    // destination account: per-business override wins; else fallback to env
-    const destination =
-      override?.stripe_account_id ||
-      process.env.DEV_STRIPE_CONNECTED_ACCOUNT_ID ||
-      process.env.STRIPE_CONNECTED_ACCOUNT_ID;
-
-    if (!destination) {
-      return NextResponse.json({ error: "Missing destination connected account id" }, { status: 500 });
+    if (!bizRes.ok) {
+      const txt = await bizRes.text().catch(() => "");
+      return Response.json({ error: `Business lookup failed: ${txt || bizRes.status}` }, { status: 500 });
     }
 
-    // create checkout session (destination charges with application fee)
+    const bizArr = (await bizRes.json().catch(() => [])) as Json[];
+    const business = bizArr[0];
+    if (!business) {
+      return Response.json({ error: "Business not found" }, { status: 404 });
+    }
+
+    // Try common column names for Connect account id
+    const candidates = [
+      business.stripe_account_id,
+      business.stripe_connect_account_id,
+      business.stripe_connected_account,
+      business.stripe_connect_id,
+      business.stripe_account,
+    ].filter((v) => typeof v === "string") as string[];
+
+    const destinationAccount = candidates.find((v) => v.startsWith("acct_"));
+    if (!destinationAccount) {
+      return Response.json(
+        { error: "This business isn’t connected to Stripe. Please connect a Stripe account first." },
+        { status: 400 }
+      );
+    }
+
+    // --- Amounts ---
+    const giftAmountCents = Math.round(amountUsd * 100);
+    const { serviceFeeCents, merchantCommissionCents, applicationFeeCents } =
+      computeFees(giftAmountCents);
+    const totalChargeCents = giftAmountCents + serviceFeeCents;
+
+    const appUrl =
+      process.env.NEXT_PUBLIC_APP_URL?.replace(/\/$/, "") || "http://localhost:3000";
+
+    // --- Create the session (use dynamic import for Stripe to avoid bundling issues) ---
+    const { default: Stripe } = await import("stripe");
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+      apiVersion: "2025-08-27.basil",
+    });
+
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      success_url: `${process.env.NEXT_PUBLIC_APP_URL}/b/${business_slug || "success"}/purchase-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.NEXT_PUBLIC_APP_URL}/b/${business_slug || ""}`,
-      customer_email: buyer_email || undefined,
       line_items: [
         {
           price_data: {
             currency: "usd",
+            unit_amount: totalChargeCents,
             product_data: {
-              name: `${(business_slug || "Gift")} gift card`,
+              name: business?.name ? `Gift to ${business.name}` : "Digital gift",
+              description: "Gift purchased on Gifty",
             },
-            unit_amount: amount,
           },
           quantity: 1,
         },
       ],
+      success_url: `${appUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${appUrl}/cancel`,
+      customer_email: buyerEmail,
+      allow_promotion_codes: true,
+
       payment_intent_data: {
-        application_fee_amount,
-        transfer_data: {
-          destination,
-        },
+        application_fee_amount: applicationFeeCents,
+        transfer_data: { destination: destinationAccount },
         metadata: {
-          business_id: business_id || "",
-          business_slug: business_slug || "",
-          business_name: business_slug ? business_slug.replace(/-/g, " ") : "",
-          buyer_email,
-          recipient_email: recipient_email || "",
-          message: message || "",
+          business_id,
+          giftAmountCents: String(giftAmountCents),
+          serviceFeeCents: String(serviceFeeCents),
+          merchantCommissionCents: String(merchantCommissionCents),
+          buyerEmail,
+          recipientEmail,
+          destinationAccount,
         },
       },
+
+      // duplicate key metadata on the session for convenience
       metadata: {
-        business_id: business_id || "",
-        business_slug: business_slug || "",
-        business_name: business_slug ? business_slug.replace(/-/g, " ") : "",
-        buyer_email,
-        recipient_email: recipient_email || "",
-        message: message || "",
+        business_id,
+        amountUsd: String(amountUsd),
+        giftAmountCents: String(giftAmountCents),
+        serviceFeeCents: String(serviceFeeCents),
+        merchantCommissionCents: String(merchantCommissionCents),
+        buyerEmail,
+        recipientEmail,
+        destinationAccount,
       },
     });
 
-    // (best-effort) log checkout intent (optional)
-    try {
-      await supabaseAdmin.from("checkouts").insert({
-        business_id,
-        amount_cents: amount,
-        buyer_email,
-        recipient_email,
-        status: "created",
-        stripe_checkout_id: session.id,
-      } as any);
-    } catch (_) {}
-
-    return NextResponse.json({ url: session.url }, { status: 200 });
+    return Response.json({ url: session.url, id: session.id }, { status: 200 });
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message || "Checkout error" }, { status: 500 });
+    return Response.json(
+      { error: e?.message ?? "Failed to create checkout session" },
+      { status: 500 }
+    );
   }
 }
