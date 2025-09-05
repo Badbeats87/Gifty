@@ -17,15 +17,13 @@ export default function AdminLoginPage() {
       const res = await fetch("/api/admin/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // IMPORTANT: ensure Set-Cookie is accepted & stored
-        credentials: "include",
+        credentials: "include", // accept Set-Cookie
         body: JSON.stringify({ token }),
       });
       if (res.ok) {
-        // hard navigation so middleware sees the cookie immediately
-        window.location.replace(next);
+        window.location.replace(next); // middleware/layout sees cookie
       } else {
-        const j = await res.json().catch(() => ({}));
+        const j = await res.json().catch(() => ({} as any));
         alert(j?.error || "Invalid token");
       }
     } finally {
@@ -40,11 +38,12 @@ export default function AdminLoginPage() {
         <div>
           <label className="block text-sm font-medium">Admin token</label>
           <input
+            name="token"
             type="password"
             className="mt-1 w-full rounded border px-3 py-2"
+            placeholder="Paste ADMIN_TOKEN…"
             value={token}
             onChange={(e) => setToken(e.target.value)}
-            placeholder="Paste ADMIN_TOKEN…"
             required
             autoFocus
           />
