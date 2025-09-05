@@ -1,10 +1,10 @@
 // src/app/dashboard/layout.tsx
 import { redirect } from "next/navigation";
 import type { ReactNode } from "react";
-import { supabaseServer } from "@/lib/supabase";
+import { supabaseServer } from "@/lib/supabase-server"; // ⬅️ changed
 
 export default async function DashboardLayout({ children }: { children: ReactNode }) {
-  const supabase = await supabaseServer(); // ✅ await the helper
+  const supabase = await supabaseServer(); // ⬅️ await
   const { data, error } = await supabase.auth.getUser();
 
   if (error || !data?.user) {

@@ -3,7 +3,7 @@
 
 import { useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { supabaseBrowser } from "@/lib/supabase";
+import { supabaseBrowser } from "@/lib/supabase-browser"; // ⬅️ changed
 
 export default function LoginPage() {
   const sp = useSearchParams();
@@ -32,7 +32,6 @@ export default function LoginPage() {
         return;
       }
 
-      // Bridge session to server cookies so server-side layouts see you as logged in
       const r = await fetch("/api/auth/cookie", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -45,7 +44,6 @@ export default function LoginPage() {
         return;
       }
 
-      // Hard redirect so the server-gated /dashboard layout re-evaluates with the cookie
       window.location.replace(next);
     } catch (e: any) {
       setErr(e?.message || "Unexpected error");
