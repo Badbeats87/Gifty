@@ -1,99 +1,92 @@
 // src/app/api/checkout/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { stripe } from "@/lib/stripe";
-import { computeApplicationFee } from "@/lib/fees";
-import { getCommissionOverrideBySlug, supabaseAdmin } from "@/lib/db";
+import { NextResponse } from "next/server";
+import Stripe from "stripe";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-export async function POST(req: NextRequest) {
+/**
+ * Create a Stripe Checkout Session for buying a gift.
+ * Body JSON:
+ * - business_id: string (required)
+ * - amountUsd: number (required, whole USD)
+ * - buyerEmail: string (required)
+ * - recipientEmail: string (optional)
+ */
+export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({}));
-    const amount = Math.max(100, Math.floor(+body.amount_cents || 0)); // min $1
-    const buyer_email = String(body.buyer_email || "");
-    const recipient_email = body.recipient_email ? String(body.recipient_email) : null;
-    const message = body.message ? String(body.message) : undefined;
+    const body = await req.json().catch(() => ({} as any));
 
-    // business identification
-    const business_id = body.business_id ? String(body.business_id) : null;
-    const business_slug = body.business_slug ? String(body.business_slug).toLowerCase() : null;
-    if (!business_id && !business_slug) {
-      return NextResponse.json({ error: "Unknown business (provide business_id or business_slug)" }, { status: 400 });
+    const business_id = String(body.business_id ?? "");
+    const amountUsd = Number(body.amountUsd ?? 0);
+    const buyerEmail = String(body.buyerEmail ?? "");
+    const recipientEmail =
+      body.recipientEmail ? String(body.recipientEmail) : "";
+
+    if (!process.env.STRIPE_SECRET_KEY) {
+      return NextResponse.json(
+        { error: "Missing STRIPE_SECRET_KEY" },
+        { status: 500 }
+      );
     }
 
-    // override lookup (optional)
-    const override = business_slug ? await getCommissionOverrideBySlug(business_slug) : null;
-
-    // compute fee
-    const application_fee_amount = computeApplicationFee(amount, override || undefined);
-
-    // destination account: per-business override wins; else fallback to env
-    const destination =
-      override?.stripe_account_id ||
-      process.env.DEV_STRIPE_CONNECTED_ACCOUNT_ID ||
-      process.env.STRIPE_CONNECTED_ACCOUNT_ID;
-
-    if (!destination) {
-      return NextResponse.json({ error: "Missing destination connected account id" }, { status: 500 });
+    if (!business_id || !Number.isFinite(amountUsd) || amountUsd <= 0 || !buyerEmail) {
+      return NextResponse.json(
+        {
+          error:
+            "Missing fields: business_id, amountUsd (>0), buyerEmail are required.",
+        },
+        { status: 400 }
+      );
     }
 
-    // create checkout session (destination charges with application fee)
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+      apiVersion: "2025-08-27.basil",
+    });
+
+    // Compute amounts in cents
+    const giftAmountCents = Math.round(amountUsd * 100);
+
+    // (Optional) Platform/merchant fees.
+    // Keep it simple for now: we JUST charge the gift amount as a single line item.
+    // If you want customer service fee + merchant commission split, we can add that after.
+    const appUrl =
+      process.env.NEXT_PUBLIC_APP_URL?.replace(/\/$/, "") ||
+      "http://localhost:3000";
+
+    // If you already store the merchant’s Stripe account id in your DB, fetch it here.
+    // To keep this file self-contained, we’ll skip that and just create a platform charge.
+    // (Destination charges/transfer_data can be added later.)
+
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      success_url: `${process.env.NEXT_PUBLIC_APP_URL}/b/${business_slug || "success"}/purchase-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.NEXT_PUBLIC_APP_URL}/b/${business_slug || ""}`,
-      customer_email: buyer_email || undefined,
       line_items: [
         {
           price_data: {
             currency: "usd",
+            unit_amount: giftAmountCents,
             product_data: {
-              name: `${(business_slug || "Gift")} gift card`,
+              name: "Digital gift",
+              description: "Gift purchased on Gifty",
             },
-            unit_amount: amount,
           },
           quantity: 1,
         },
       ],
-      payment_intent_data: {
-        application_fee_amount,
-        transfer_data: {
-          destination,
-        },
-        metadata: {
-          business_id: business_id || "",
-          business_slug: business_slug || "",
-          business_name: business_slug ? business_slug.replace(/-/g, " ") : "",
-          buyer_email,
-          recipient_email: recipient_email || "",
-          message: message || "",
-        },
-      },
+      success_url: `${appUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${appUrl}/cancel`,
+      customer_email: buyerEmail,
+      allow_promotion_codes: true,
       metadata: {
-        business_id: business_id || "",
-        business_slug: business_slug || "",
-        business_name: business_slug ? business_slug.replace(/-/g, " ") : "",
-        buyer_email,
-        recipient_email: recipient_email || "",
-        message: message || "",
+        business_id,
+        amountUsd: String(amountUsd),
+        buyerEmail,
+        recipientEmail,
       },
     });
 
-    // (best-effort) log checkout intent (optional)
-    try {
-      await supabaseAdmin.from("checkouts").insert({
-        business_id,
-        amount_cents: amount,
-        buyer_email,
-        recipient_email,
-        status: "created",
-        stripe_checkout_id: session.id,
-      } as any);
-    } catch (_) {}
-
-    return NextResponse.json({ url: session.url }, { status: 200 });
+    return NextResponse.json({ url: session.url, id: session.id }, { status: 200 });
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message || "Checkout error" }, { status: 500 });
+    return NextResponse.json(
+      { error: e?.message ?? "Failed to create checkout session" },
+      { status: 500 }
+    );
   }
 }
