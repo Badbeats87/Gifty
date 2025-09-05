@@ -1,26 +1,24 @@
 // src/app/admin/gift-cards/page.tsx
 import { getSupabaseAdmin } from "../../../lib/supabaseAdmin";
+import CopyCode from "./CopyCode";
 
-type GiftCardRow = {
-  id: string;
-  code?: string | null;
-  business_id?: string | null;
-  amount_usd?: number | null;
-  status?: string | null; // e.g., issued | redeemed | voided
-  issued_at?: string | null;
-  redeemed_at?: string | null;
-  created_at?: string | null; // fallback if issued_at not present
-  buyer_email?: string | null;
-  recipient_email?: string | null;
-};
+type AnyRow = Record<string, any>;
 
-type BusinessRow = {
-  id: string;
-  name: string;
-};
+function pickAmount(row: AnyRow): number | null {
+  if (typeof row.amount_usd === "number") return row.amount_usd;
+  if (typeof row.amount === "number") return row.amount;
+  if (typeof row.value_usd === "number") return row.value_usd;
+  if (typeof row.value_cents === "number") return row.value_cents / 100;
+  return null;
+}
+
+function pickIssuedAt(row: AnyRow): string | null {
+  // be flexible with timestamp columns
+  return row.issued_at ?? row.created_at ?? row.purchased_at ?? row.updated_at ?? null;
+}
 
 function formatUSD(n: number | null | undefined) {
-  if (typeof n !== "number") return "—";
+  if (typeof n !== "number" || Number.isNaN(n)) return "—";
   try {
     return new Intl.NumberFormat(undefined, {
       style: "currency",
@@ -35,55 +33,60 @@ function formatUSD(n: number | null | undefined) {
 export default async function AdminGiftCards() {
   const supabase = getSupabaseAdmin();
 
-  // 1) Fetch gift cards (most recent first)
-  const { data: cards, error: cardsErr } = await supabase
-    .from("gift_cards")
-    .select(
-      `
-      id,
-      code,
-      business_id,
-      amount_usd,
-      status,
-      issued_at,
-      redeemed_at,
-      created_at,
-      buyer_email,
-      recipient_email
-    `
-    )
-    .order("issued_at", { ascending: false })
-    .order("created_at", { ascending: false })
-    .limit(300);
+  // --- 1) Try to fetch with a safe order; fall back if column doesn't exist
+  let rows: AnyRow[] = [];
+  let lastErr: string | null = null;
 
-  if (cardsErr) {
+  // Attempt A: order by created_at (common)
+  {
+    const { data, error } = await supabase
+      .from("gift_cards")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(300);
+
+    if (!error && data) {
+      rows = data as AnyRow[];
+    } else {
+      lastErr = error?.message ?? null;
+    }
+  }
+
+  // Attempt B: no order (if created_at doesn’t exist)
+  if (rows.length === 0) {
+    const { data, error } = await supabase.from("gift_cards").select("*").limit(300);
+    if (!error && data) {
+      rows = data as AnyRow[];
+      lastErr = null;
+    } else {
+      lastErr = error?.message ?? lastErr;
+    }
+  }
+
+  // --- 2) If still failing, show the error
+  if (lastErr) {
     return (
       <main className="max-w-6xl mx-auto w-full">
         <h1 className="text-3xl font-bold mb-6 text-gray-900">🎁 Gift Cards (ADMIN)</h1>
         <div className="p-4 bg-red-50 border border-red-200 rounded text-red-800">
-          Failed to load gift cards: <span className="font-mono">{cardsErr.message}</span>
+          Failed to load gift cards: <span className="font-mono">{lastErr}</span>
         </div>
       </main>
     );
   }
 
-  const rows: GiftCardRow[] = (cards ?? []) as GiftCardRow[];
-
-  // 2) Lookup business names for the set of business_ids we saw
+  // --- 3) Optional: lookup business names if business_id exists
   const bizIds = Array.from(
     new Set(rows.map((r) => r.business_id).filter((x): x is string => !!x))
   );
 
   let bizMap = new Map<string, string>();
   if (bizIds.length > 0) {
-    const { data: biz, error: bizErr } = await supabase
+    const { data: biz } = await supabase
       .from("businesses")
       .select("id, name")
       .in("id", bizIds);
-
-    if (!bizErr && biz) {
-      (biz as BusinessRow[]).forEach((b) => bizMap.set(b.id, b.name));
-    }
+    (biz ?? []).forEach((b: any) => bizMap.set(b.id, b.name));
   }
 
   return (
@@ -112,44 +115,38 @@ export default async function AdminGiftCards() {
             </thead>
             <tbody className="[&>tr:nth-child(even)]:bg-gray-50">
               {rows.map((g) => {
-                const codeShort = g.code
-                  ? g.code.length > 12
-                    ? `${g.code.slice(0, 4)}•••${g.code.slice(-4)}`
-                    : g.code
-                  : g.id.slice(0, 8);
-                const merchant = g.business_id ? bizMap.get(g.business_id) ?? "—" : "—";
-                const amount = formatUSD(g.amount_usd ?? null);
-                const status = (g.status ?? "—").toString();
-                const issued =
-                  g.issued_at
-                    ? new Date(g.issued_at).toLocaleString()
-                    : g.created_at
-                    ? new Date(g.created_at).toLocaleString()
-                    : "—";
-                const redeemed = g.redeemed_at ? new Date(g.redeemed_at).toLocaleString() : "—";
-                const buyer = g.buyer_email ?? "—";
-                const recipient = g.recipient_email ?? "—";
+                const id: string = g.id;
+                const code: string | undefined = g.code;
+                const businessId: string | undefined = g.business_id;
+                const merchant = businessId ? bizMap.get(businessId) ?? "—" : "—";
+                const amount = formatUSD(pickAmount(g));
+                const status = (g.status ?? g.state ?? "—").toString();
+                const issuedAt = pickIssuedAt(g);
+                const redeemedAt: string | null = g.redeemed_at ?? g.redeemedAt ?? null;
+                const buyer: string | null = g.buyer_email ?? g.buyer ?? null;
+                const recipient: string | null = g.recipient_email ?? g.recipient ?? null;
+
+                const codeShort = code
+                  ? code.length > 12
+                    ? `${code.slice(0, 4)}•••${code.slice(-4)}`
+                    : code
+                  : id?.slice(0, 8);
 
                 return (
-                  <tr key={g.id} className="hover:bg-gray-100">
+                  <tr key={id} className="hover:bg-gray-100">
                     <Td>
-                      <div className="font-medium">{codeShort}</div>
-                      <div className="text-xs text-gray-600 font-mono">{g.id}</div>
+                      <div className="font-medium">{codeShort ?? "—"}</div>
+                      <div className="text-xs text-gray-600 font-mono">{id}</div>
                     </Td>
                     <Td>{merchant}</Td>
                     <Td>{amount}</Td>
                     <Td className="capitalize">{status}</Td>
-                    <Td>{issued}</Td>
-                    <Td>{redeemed}</Td>
-                    <Td className="truncate max-w-[180px]">{buyer}</Td>
-                    <Td className="truncate max-w-[180px]">{recipient}</Td>
+                    <Td>{issuedAt ? new Date(issuedAt).toLocaleString() : "—"}</Td>
+                    <Td>{redeemedAt ? new Date(redeemedAt).toLocaleString() : "—"}</Td>
+                    <Td className="truncate max-w-[180px]">{buyer ?? "—"}</Td>
+                    <Td className="truncate max-w-[180px]">{recipient ?? "—"}</Td>
                     <Td>
-                      <button
-                        className="text-blue-600 hover:underline"
-                        onClick={() => navigator.clipboard?.writeText(g.code ?? "")}
-                      >
-                        Copy code
-                      </button>
+                      {code ? <CopyCode value={code} /> : <span className="text-gray-500">—</span>}
                     </Td>
                   </tr>
                 );
