@@ -1,5 +1,5 @@
 // src/app/admin/merchants/page.tsx
-import { getSupabaseServer } from "@/src/lib/supabaseServer";
+import { getSupabaseAdmin } from "../../../lib/supabaseAdmin";
 
 type BusinessRow = {
   id: string;
@@ -10,7 +10,7 @@ type BusinessRow = {
 };
 
 export default async function AdminMerchants() {
-  const supabase = getSupabaseServer();
+  const supabase = getSupabaseAdmin();
 
   const { data, error } = await supabase
     .from("businesses")
