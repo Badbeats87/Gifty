@@ -4,12 +4,10 @@ import type { ReactNode } from "react";
 import { supabaseServer } from "@/lib/supabase";
 
 export default async function DashboardLayout({ children }: { children: ReactNode }) {
-  // Server-side auth check for ALL /dashboard routes
-  const supabase = supabaseServer();
+  const supabase = await supabaseServer(); // ✅ await the helper
   const { data, error } = await supabase.auth.getUser();
 
   if (error || !data?.user) {
-    // send them to login and come back to /dashboard
     redirect(`/login?next=${encodeURIComponent("/dashboard")}`);
   }
 
