@@ -1,71 +1,105 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
+// src/app/api/redeem/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { supabaseAdmin } from "@/lib/db";
 
-// Create a Supabase client that uses the caller's auth token
-function supabaseFromRequest(req: NextRequest) {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-  const authHeader = req.headers.get('authorization') || '';
-  return createClient(supabaseUrl, anonKey, {
-    global: { headers: { Authorization: authHeader } },
-    auth: { persistSession: false },
-  });
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+type Body = {
+  code?: string;
+  business_slug?: string; // optional: ensure the code belongs to this business
+};
+
+function bad(msg: string, status = 400) {
+  return NextResponse.json({ error: msg }, { status });
+}
+
+function normalizeCode(raw: string) {
+  // Uppercase, remove non-alphanumerics, re-group as AAAA-BBBB-CCCC
+  const upper = raw.toUpperCase();
+  const alnum = upper.replace(/[^A-Z0-9]/g, "");
+  const grouped = alnum.match(/.{1,4}/g)?.join("-") ?? alnum;
+  return grouped;
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const supabase = supabaseFromRequest(req);
+    const json = (await req.json()) as Body | undefined;
+    const raw = (json?.code || "").toString().trim();
+    if (!raw) return bad("Missing field: code");
 
-    // Ensure the caller is signed in
-    const { data: userData, error: userErr } = await supabase.auth.getUser();
-    if (userErr || !userData.user) {
-      return NextResponse.json({ error: 'Not signed in' }, { status: 401 });
+    const code = normalizeCode(raw);
+
+    // Try exact match first (our webhook saves codes already formatted XXX-XXXX-XXXX)
+    let { data: gift, error: selErr } = await supabaseAdmin
+      .from("gift_cards")
+      .select(
+        "id, code, status, remaining_amount_cents, initial_amount_cents, amount_cents, currency, business_slug, buyer_email, recipient_email, stripe_checkout_id, order_id, created_at"
+      )
+      .eq("code", code)
+      .maybeSingle();
+
+    if (selErr) return bad(`DB error (select): ${selErr.message}`, 500);
+
+    // If not found, try case-insensitive (defensive)
+    if (!gift) {
+      const { data: gift2, error: selErr2 } = await supabaseAdmin
+        .from("gift_cards")
+        .select(
+          "id, code, status, remaining_amount_cents, initial_amount_cents, amount_cents, currency, business_slug, buyer_email, recipient_email, stripe_checkout_id, order_id, created_at"
+        )
+        .ilike("code", code) // case-insensitive
+        .maybeSingle();
+
+      if (selErr2) return bad(`DB error (select2): ${selErr2.message}`, 500);
+      gift = gift2 ?? null;
     }
-    const userId = userData.user.id;
 
-    const body = await req.json().catch(() => ({}));
-    const { businessId, code, amountCents, notes } = body as {
-      businessId?: string;
-      code?: string;
-      amountCents?: number;
-      notes?: string;
+    if (!gift) {
+      // Helpful hint if the code came from an older email.
+      return bad(
+        "Gift code not found. If this code came from an older email (before we fixed storage), please create a new test purchase and use that new code."
+      );
+    }
+
+    if (json?.business_slug && gift.business_slug && gift.business_slug !== json.business_slug) {
+      return bad("Gift code does not belong to this business", 403);
+    }
+
+    if (gift.status !== "issued" || (gift.remaining_amount_cents ?? 0) <= 0) {
+      return bad("Gift already redeemed or has no remaining balance", 409);
+    }
+
+    // Full redemption (MVP): mark as redeemed and zero out remaining
+    const { error: updErr } = await supabaseAdmin
+      .from("gift_cards")
+      .update({
+        status: "redeemed",
+        remaining_amount_cents: 0,
+        // If your schema has redeemed_at, you can also set it:
+        // redeemed_at: new Date().toISOString(),
+      })
+      .eq("id", gift.id);
+
+    if (updErr) return bad(`DB error (update): ${updErr.message}`, 500);
+
+    const result = {
+      code: gift.code,
+      currency: gift.currency ?? "usd",
+      amount_cents: gift.amount_cents ?? gift.initial_amount_cents ?? 0,
+      initial_amount_cents: gift.initial_amount_cents ?? gift.amount_cents ?? 0,
+      remaining_amount_cents: 0,
+      status: "redeemed",
+      business_slug: gift.business_slug ?? null,
+      buyer_email: gift.buyer_email ?? null,
+      recipient_email: gift.recipient_email ?? null,
+      order_id: gift.order_id ?? null,
+      stripe_checkout_id: gift.stripe_checkout_id ?? null,
+      created_at: gift.created_at,
     };
 
-    if (!businessId || typeof businessId !== 'string') {
-      return NextResponse.json({ error: 'businessId is required' }, { status: 400 });
-    }
-    if (!code || typeof code !== 'string') {
-      return NextResponse.json({ error: 'code is required' }, { status: 400 });
-    }
-    const amount = Number(amountCents);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return NextResponse.json({ error: 'amountCents must be > 0' }, { status: 400 });
-    }
-
-    // Call the atomic redemption function
-    const { data, error } = await supabase.rpc('redeem_gift_card', {
-      p_business_id: businessId,
-      p_code: code,
-      p_amount_cents: amount,
-      p_user_id: userId,
-      p_notes: notes ?? null,
-    });
-
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 400 });
-    }
-
-    // data is a rowset with the fields we RETURNed in the function
-    const row = Array.isArray(data) ? data[0] : data;
-
-    return NextResponse.json({
-      ok: true,
-      gift_card_id: row?.gift_card_id ?? null,
-      redemption_id: row?.redemption_id ?? null,
-      remaining_after: row?.remaining_after ?? null,
-      new_status: row?.new_status ?? null,
-    });
+    return NextResponse.json({ ok: true, gift: result }, { status: 200 });
   } catch (e: any) {
-    return NextResponse.json({ error: e.message || 'Redeem failed' }, { status: 500 });
+    return bad(e?.message || "Unexpected error", 500);
   }
 }

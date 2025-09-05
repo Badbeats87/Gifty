@@ -27,15 +27,15 @@ async function recordGift(opts: {
   recipient_email?: string | null;
   stripe_checkout_id: string;
   order_id: string;
-  business_name?: string | null;
-  message?: string | null;
 }) {
   try {
-    // Insert matches your DB: includes initial_amount_cents (NOT NULL in your schema)
+    // Only insert columns we KNOW exist in your table to avoid schema issues.
+    // Your DB requires: initial_amount_cents (NOT NULL) and remaining_amount_cents (NOT NULL).
     const { error } = await supabaseAdmin.from("gift_cards").insert({
       code: opts.code,
       amount_cents: opts.amount_cents,
-      initial_amount_cents: opts.amount_cents, // <— satisfy NOT NULL
+      initial_amount_cents: opts.amount_cents,     // satisfy NOT NULL
+      remaining_amount_cents: opts.amount_cents,   // satisfy NOT NULL
       currency: opts.currency,
       business_id: opts.business_id ?? null,
       business_slug: opts.business_slug ?? null,
@@ -44,9 +44,7 @@ async function recordGift(opts: {
       status: "issued",
       stripe_checkout_id: opts.stripe_checkout_id,
       order_id: opts.order_id,
-      business_name: opts.business_name ?? null, // harmless if column doesn’t exist; remove if your table doesn’t have it
-      message: opts.message ?? null,             // harmless if column doesn’t exist; remove if your table doesn’t have it
-    } as any); // cast to avoid TS complaining if your table has extra columns
+    } as any);
     if (error) {
       console.warn("[webhook] failed to insert gift_cards (non-fatal):", error);
     }
@@ -99,16 +97,21 @@ export async function POST(req: NextRequest) {
       const md = session.metadata ?? {};
       const business_id = (md["business_id"] as string) || null;
       const business_slug = (md["business_slug"] as string) || null;
-      const business_name =
-        (md["business_name"] as string) || (business_slug ?? "Your Gift");
       const buyer_email = String(
         md["buyer_email"] ?? session.customer_details?.email ?? ""
       );
       const recipient_email = String(md["recipient_email"] ?? "") || null;
       const message = (md["message"] as string) || undefined;
 
+      const business_name_guess =
+        (md["business_name"] as string) ||
+        (business_slug
+          ? business_slug.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+          : "Your Gift");
+
       const code = generateGiftCode();
 
+      // Persist gift (best effort)
       await recordGift({
         code,
         amount_cents: amountTotal,
@@ -119,17 +122,16 @@ export async function POST(req: NextRequest) {
         recipient_email,
         stripe_checkout_id: sessionId,
         order_id: orderId,
-        business_name,
-        message: message ?? null,
       });
 
+      // Email: send to recipient if provided; otherwise to buyer.
       const to = recipient_email || buyer_email;
       if (to) {
         await sendGiftEmail({
           to,
           cc: recipient_email ? [buyer_email] : undefined,
           code,
-          businessName: business_name,
+          businessName: business_name_guess,
           amountCents: amountTotal,
           currency,
           message,
