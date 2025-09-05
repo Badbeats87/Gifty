@@ -1,0 +1,72 @@
+## git status
+## main...origin/main
+ M src/app/api/checkout/route.ts
+ M src/app/api/stripe/webhook/route.ts
+?? repo-snapshot.txt
+?? src/lib/db.ts
+?? src/lib/fees.ts
+?? src/lib/stripe.ts
+
+## node -v
+v19.7.0
+
+## env keys present (.env.local)
+NEXT_PUBLIC_SUPABASE_URL=<redacted>
+NEXT_PUBLIC_SUPABASE_ANON_KEY=<redacted>
+SUPABASE_SERVICE_ROLE_KEY=<redacted>
+STRIPE_SECRET_KEY=<redacted>
+NEXT_PUBLIC_APP_URL=<redacted>
+RESEND_API_KEY=<redacted>
+NEXT_PUBLIC_APP_URL=<redacted>
+
+## package.json (name/version/scripts)
+{
+  name: 'gifty-app',
+  version: '0.1.0',
+  scripts: {
+    dev: 'next dev',
+    build: 'next build',
+    start: 'next start',
+    lint: 'eslint'
+  }
+}
+
+## file tree
+./CHANGELOG.md
+./README.md
+./next-env.d.ts
+./next.config.ts
+./package-lock.json
+./package.json
+./src/app/api/checkout/fulfill/route.ts
+./src/app/api/checkout/route.ts
+./src/app/api/ping/route.ts
+./src/app/api/redeem/route.ts
+./src/app/api/stripe/connect-link/route.ts
+./src/app/api/stripe/status/route.ts
+./src/app/api/stripe/webhook/route.ts
+./src/app/api/test-send-gift/route.ts
+./src/app/auth/callback/page.tsx
+./src/app/auth/reset/page.tsx
+./src/app/b/[slug]/page.tsx
+./src/app/b/[slug]/purchase-client.tsx
+./src/app/b/[slug]/purchase-success.tsx
+./src/app/card/[code]/page.tsx
+./src/app/dashboard/history/page.tsx
+./src/app/dashboard/page.tsx
+./src/app/dashboard/redeem/page.tsx
+./src/app/forgot/page.tsx
+./src/app/layout.tsx
+./src/app/login/page.tsx
+./src/app/logout/page.tsx
+./src/app/page.tsx
+./src/app/signup/page.tsx
+./src/components/AppHeader.tsx
+./src/components/BackButton.tsx
+./src/emails/GiftEmail.tsx
+./src/lib/db.ts
+./src/lib/email.ts
+./src/lib/fees.ts
+./src/lib/stripe.ts
+./src/lib/supabase.ts
+./tsconfig.json

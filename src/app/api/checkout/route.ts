@@ -1,117 +1,128 @@
 // src/app/api/checkout/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import Stripe from "stripe";
-import { createClient } from "@supabase/supabase-js";
+import { stripe } from "@/lib/stripe";
+import { computeFees } from "@/lib/fees";
+import {
+  getBusinessById,
+  getBusinessBySlug,
+  recordCheckoutIntent,
+} from "@/lib/db";
 
-export const runtime = "nodejs";
+type Body =
+  | {
+      business_id?: string;
+      business_slug?: string;
+      amountUsd?: number | string;
+      buyerEmail?: string;
+      recipientEmail?: string;
+    }
+  | undefined;
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: "2025-08-27.basil" as any,
-});
-
-// Server-side Supabase (service role)
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
-
-// Simple helpers
-function bad(msg: string, status = 400) {
-  return NextResponse.json({ error: msg }, { status });
+const APP_URL = process.env.NEXT_PUBLIC_APP_URL;
+if (!APP_URL) {
+  throw new Error("NEXT_PUBLIC_APP_URL not set");
 }
-function envRequired(name: string) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
+
+function parseAmountCents(amountUsd: number | string | undefined) {
+  if (amountUsd === undefined || amountUsd === null || amountUsd === "") {
+    throw new Error("Missing field: amountUsd");
+  }
+  const asNumber =
+    typeof amountUsd === "string" ? Number(amountUsd) : Number(amountUsd);
+  if (!Number.isFinite(asNumber)) throw new Error("Invalid amount");
+  // Allow decimals like 25.50
+  const cents = Math.round(asNumber * 100);
+  if (cents <= 0) throw new Error("Invalid amount");
+  return cents;
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const APP_URL = envRequired("NEXT_PUBLIC_APP_URL");
+    const json = (await req.json()) as Body;
 
-    const body = await req.json().catch(() => ({}));
-    const {
-      businessId,
-      amountUsd,
-      buyerEmail,
-      recipientEmail,
-      giftMessage,
-      // NOTE: client can pass slug, but we’ll fetch from DB to be safe
-      slug: _ignoredSlug,
-    } = body ?? {};
+    const businessId = json?.business_id;
+    const businessSlug = json?.business_slug;
+    const buyerEmail = json?.buyerEmail;
+    const recipientEmail = json?.recipientEmail ?? null;
 
-    // Basic validation
-    if (!businessId) return bad("Missing fields: businessId");
-    if (!buyerEmail) return bad("Missing fields: buyerEmail");
-    const amt = Number(amountUsd);
-    if (!Number.isFinite(amt) || amt <= 0) return bad("Invalid amount");
+    if (!buyerEmail) {
+      return NextResponse.json(
+        { error: "Missing field: buyerEmail" },
+        { status: 400 }
+      );
+    }
 
-    // Look up business (need slug for success_url and Stripe account for destination charges)
-    const { data: biz, error: bizErr } = await supabase
-      .from("businesses")
-      .select("id, slug, name, stripe_account_id")
-      .eq("id", businessId)
-      .single();
+    // Resolve business
+    let business =
+      (businessId ? await getBusinessById(businessId) : null) ??
+      (businessSlug ? await getBusinessBySlug(businessSlug) : null);
 
-    if (bizErr) return bad(`Business lookup failed: ${bizErr.message}`, 500);
-    if (!biz) return bad("Business not found", 404);
-    if (!biz.stripe_account_id) return bad("Business is not connected to Stripe", 400);
+    if (!business) {
+      return NextResponse.json(
+        { error: "Unknown business (provide business_id or business_slug)" },
+        { status: 400 }
+      );
+    }
 
-    // Commission model (platform fee taken via application_fee_amount)
-    // Adjust percentages as needed.
-    const PLATFORM_FEE_RATE = 0.10; // 10% to platform (example)
-    const applicationFeeAmount = Math.round(amt * 100 * PLATFORM_FEE_RATE);
+    if (!business.stripe_account_id) {
+      return NextResponse.json(
+        { error: "Business is not connected to Stripe yet." },
+        { status: 400 }
+      );
+    }
 
-    // Build URLs that actually exist — success on the business page with session_id
-    const successUrl = `${APP_URL}/b/${biz.slug}?session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl = `${APP_URL}/b/${biz.slug}?canceled=1`;
+    const amountCents = parseAmountCents(json?.amountUsd);
+    const { applicationFeeAmount } = computeFees(amountCents);
 
-    // Create Checkout Session (destination charge to connected account)
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      currency: "usd",
-      customer_email: buyerEmail,
-      success_url: successUrl,
-      cancel_url: cancelUrl,
+      allow_promotion_codes: true,
       line_items: [
         {
           price_data: {
             currency: "usd",
-            unit_amount: Math.round(amt * 100),
             product_data: {
-              name: `Gift card for ${biz.name}`,
-              metadata: {
-                business_id: biz.id,
-              },
+              name: `${business.name} – Gift Card`,
             },
+            unit_amount: amountCents,
           },
           quantity: 1,
         },
       ],
+      success_url: `${APP_URL}/b/${business.slug}/purchase-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${APP_URL}/b/${business.slug}`,
+      customer_email: buyerEmail,
+      metadata: {
+        business_id: business.id,
+        business_slug: business.slug,
+        buyer_email: buyerEmail,
+        recipient_email: recipientEmail ?? "",
+      },
       payment_intent_data: {
         application_fee_amount: applicationFeeAmount,
         transfer_data: {
-          destination: biz.stripe_account_id!,
+          destination: business.stripe_account_id,
         },
       },
-      metadata: {
-        business_id: biz.id,
-        amount_usd: String(amt),
-        buyer_email: buyerEmail,
-        recipient_email: recipientEmail || "",
-        gift_message: giftMessage || "",
-      },
-      // Helpful to ensure full customer_details are populated
-      customer_creation: "if_required",
-      allow_promotion_codes: true,
     });
 
-    return NextResponse.json({ id: session.id, url: session.url });
+    // Optional: record a local intent (best effort)
+    try {
+      await recordCheckoutIntent({
+        business_id: business.id,
+        amount_cents: amountCents,
+        buyer_email: buyerEmail,
+        recipient_email: recipientEmail,
+        stripe_checkout_id: session.id,
+      });
+    } catch (e) {
+      console.warn("[checkout] recordCheckoutIntent failed:", e);
+    }
+
+    return NextResponse.json({ id: session.id, url: session.url }, { status: 200 });
   } catch (err: any) {
-    console.error(err);
-    return NextResponse.json(
-      { error: err?.message ?? "Internal error" },
-      { status: 500 }
-    );
+    const message =
+      typeof err?.message === "string" ? err.message : "Unexpected error";
+    return NextResponse.json({ error: message }, { status: 400 });
   }
 }

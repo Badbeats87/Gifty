@@ -1,91 +1,79 @@
 // src/lib/email.ts
 import { Resend } from "resend";
-import React from "react";
-import GiftEmail from "@/emails/GiftEmail";
-import { renderAsync } from "@react-email/render";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+if (!RESEND_API_KEY) {
+  console.warn("[email] RESEND_API_KEY not set. Emails will fail.");
+}
+const resend = new Resend(RESEND_API_KEY || "missing");
 
-type SendGiftArgs = {
-  to: string | string[];
-  businessName: string;
-  amountUsd: number;
-  code: string;
-  message?: string;
-};
-
-function shortKey(k?: string) {
-  return k ? `${k.slice(0, 6)}…${k.slice(-4)}` : "(missing)";
+function formatAmount(amountCents: number, currency: string) {
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: currency.toUpperCase(),
+      minimumFractionDigits: 2,
+    }).format((amountCents || 0) / 100);
+  } catch {
+    // Fallback
+    return `$${((amountCents || 0) / 100).toFixed(2)} ${currency.toUpperCase()}`;
+  }
 }
 
-export async function sendGiftEmail({
-  to,
-  businessName,
-  amountUsd,
-  code,
-  message,
-}: SendGiftArgs) {
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
-  const from = process.env.EMAIL_FROM ?? "Gifty <no-reply@example.com>";
-  const redeemUrl = `${appUrl}/card/${encodeURIComponent(code)}`;
+export async function sendGiftEmail(input: {
+  to: string;
+  cc?: string[];
+  code: string;
+  businessName: string;
+  amountCents: number;
+  currency: string;
+  message?: string;
+}) {
+  const subject = `Your ${input.businessName} gift card`;
+  const prettyAmount = formatAmount(input.amountCents, input.currency);
 
-  // ✅ Basic env checks + helpful logs (visible in server console)
-  if (!process.env.RESEND_API_KEY) {
-    throw new Error("CONFIG: Missing RESEND_API_KEY in .env.local");
-  }
-  console.log("[email] FROM:", from);
-  console.log("[email] RESEND_API_KEY:", shortKey(process.env.RESEND_API_KEY));
-  console.log("[email] TO:", to);
+  const html = `
+    <div style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; line-height:1.5; color:#111;">
+      <h2 style="margin:0 0 12px 0;">You've received a gift! 🎁</h2>
+      <p style="margin:0 0 8px 0;">Business: <strong>${escapeHtml(input.businessName)}</strong></p>
+      <p style="margin:0 0 8px 0;">Amount: <strong>${prettyAmount}</strong></p>
+      ${
+        input.message
+          ? `<p style="margin:0 0 8px 0;">Message: <em>${escapeHtml(input.message)}</em></p>`
+          : ""
+      }
+      <p style="margin:16px 0;">Your gift code:</p>
+      <div style="font-size:20px; letter-spacing:2px; font-weight:700; border:2px dashed #111; padding:12px 16px; display:inline-block;">
+        ${escapeHtml(input.code)}
+      </div>
+      <p style="margin:16px 0 0 0; font-size:12px; color:#555;">
+        Show this code at the business to redeem your gift. Keep it safe.
+      </p>
+      <hr style="margin:20px 0; border:none; border-top:1px solid #eee;" />
+      <p style="margin:0; color:#555; font-size:12px;">Sent by Gifty</p>
+    </div>
+  `;
 
-  // 1) Try a minimal TEXT-ONLY payload (bypasses HTML rendering entirely)
+  // Use Resend dev sender to avoid domain setup.
+  const from = "Gifty <onboarding@resend.dev>";
   try {
-    const { data, error } = await resend.emails.send({
+    await resend.emails.send({
       from,
-      to,
-      subject: `Your Gifty for ${businessName}`,
-      text: `Enjoy $${amountUsd} at ${businessName}.\n\nGift code: ${code}\nRedeem: ${redeemUrl}\n\nMessage: ${message ?? "-"}`,
-    });
-
-    if (error) {
-      // Throw a very detailed error so we can see what's wrong
-      throw new Error(
-        `Resend TEXT send failed: ${JSON.stringify(error, null, 2)}`
-      );
-    }
-
-    // 2) If text-only works, send the nice HTML version (optional)
-    const html = await renderAsync(
-      React.createElement(GiftEmail, {
-        businessName,
-        amountUsd,
-        code,
-        redeemUrl,
-        message,
-      })
-    );
-
-    const htmlResult = await resend.emails.send({
-      from,
-      to,
-      subject: `Your Gifty for ${businessName}`,
+      to: [input.to],
+      cc: input.cc,
+      subject,
       html,
     });
-
-    if (htmlResult.error) {
-      throw new Error(
-        `Resend HTML send failed: ${JSON.stringify(htmlResult.error, null, 2)}`
-      );
-    }
-
-    return htmlResult.data ?? data;
-  } catch (e: any) {
-    // Bubble up EVERYTHING so our route can show it to you
-    const detail = {
-      name: e?.name,
-      message: e?.message,
-      stack: e?.stack,
-    };
-    console.error("[email] SEND ERROR", detail);
-    throw e;
+  } catch (e) {
+    console.warn("[email] resend send failed (non-fatal):", e);
   }
+}
+
+function escapeHtml(s: string) {
+  return s
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }

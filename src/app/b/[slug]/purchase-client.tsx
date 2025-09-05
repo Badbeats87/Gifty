@@ -1,127 +1,126 @@
-'use client';
+"use client";
 
-import { useState } from 'react';
+import { useState, FormEvent } from "react";
 
-export default function ClientBuyForm({
-  slug,
-  businessName,
-  businessId,
-}: {
-  slug: string;
+type Props = {
+  businessSlug: string;
   businessName: string;
-  businessId: string;
-}) {
-  const [amount, setAmount] = useState<number>(25);
-  const [buyerEmail, setBuyerEmail] = useState<string>('');
-  const [recipientEmail, setRecipientEmail] = useState<string>('');
-  const [giftMessage, setGiftMessage] = useState<string>('');
+};
+
+export default function PurchaseClient({ businessSlug, businessName }: Props) {
+  const [amountUsd, setAmountUsd] = useState<string>("25");
+  const [buyerEmail, setBuyerEmail] = useState<string>("");
+  const [recipientEmail, setRecipientEmail] = useState<string>("");
+  const [message, setMessage] = useState<string>("");
   const [loading, setLoading] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  async function startCheckout(e: React.FormEvent) {
+  async function onSubmit(e: FormEvent) {
     e.preventDefault();
-    setMsg(null);
-
-    // quick client-side guardrails
-    const amt = Number(amount);
-    if (!Number.isFinite(amt) || amt <= 0) {
-      setMsg('Please enter a valid amount.');
-      return;
-    }
-    if (!buyerEmail) {
-      setMsg('Please enter your email.');
-      return;
-    }
-
+    setError(null);
     setLoading(true);
+
     try {
-      // IMPORTANT: send the keys the API expects
-      const res = await fetch('/api/checkout', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const res = await fetch("/api/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          businessId,
-          amountUsd: amt,
+          business_slug: businessSlug, // <-- IMPORTANT
+          amountUsd,
           buyerEmail,
           recipientEmail: recipientEmail || undefined,
-          giftMessage: giftMessage || undefined,
-          // slug is still available if your API wants to log it, but not required
-          slug,
+          message: message || undefined,
         }),
       });
 
-      const json = await res.json();
+      const data = await res.json();
+
       if (!res.ok) {
-        setMsg(json?.error || 'Something went wrong.');
+        setError(data?.error || "Something went wrong");
+        setLoading(false);
         return;
       }
 
-      // redirect to Stripe Checkout
-      if (json?.url) {
-        window.location.href = json.url as string;
+      if (data?.url) {
+        // Redirect to Stripe Checkout
+        window.location.href = data.url as string;
         return;
       }
-      setMsg('Unexpected response from checkout.');
+
+      setError("Unexpected response from server.");
     } catch (err: any) {
-      setMsg(err?.message || 'Network error.');
+      setError(err?.message || "Network error");
     } finally {
       setLoading(false);
     }
   }
 
   return (
-    <form onSubmit={startCheckout} className="space-y-4">
-      <label className="block space-y-2">
-        <span className="text-sm font-medium">Amount (USD)</span>
+    <form onSubmit={onSubmit} className="space-y-4 max-w-md">
+      <div>
+        <label className="block text-sm font-medium">Amount (USD)</label>
         <input
           type="number"
-          min={1}
-          step={1}
-          value={amount}
-          onChange={(e) => setAmount(Number(e.target.value))}
-          className="border rounded-lg p-3 w-full"
+          step="0.01"
+          min="1"
+          value={amountUsd}
+          onChange={(e) => setAmountUsd(e.target.value)}
+          className="mt-1 w-full rounded border px-3 py-2"
+          required
         />
-      </label>
+      </div>
 
-      <label className="block space-y-2">
-        <span className="text-sm font-medium">Your email (for receipt)</span>
+      <div>
+        <label className="block text-sm font-medium">Your email (for receipt)</label>
         <input
           type="email"
           value={buyerEmail}
           onChange={(e) => setBuyerEmail(e.target.value)}
-          className="border rounded-lg p-3 w-full"
+          className="mt-1 w-full rounded border px-3 py-2"
           placeholder="you@example.com"
+          required
         />
-      </label>
+      </div>
 
-      <label className="block space-y-2">
-        <span className="text-sm font-medium">Recipient email (optional)</span>
+      <div>
+        <label className="block text-sm font-medium">Recipient email (optional)</label>
         <input
           type="email"
           value={recipientEmail}
           onChange={(e) => setRecipientEmail(e.target.value)}
-          className="border rounded-lg p-3 w-full"
+          className="mt-1 w-full rounded border px-3 py-2"
           placeholder="friend@example.com"
         />
-      </label>
+      </div>
 
-      <label className="block space-y-2">
-        <span className="text-sm font-medium">Message (optional)</span>
+      <div>
+        <label className="block text-sm font-medium">Message (optional)</label>
         <input
           type="text"
-          value={giftMessage}
-          onChange={(e) => setGiftMessage(e.target.value)}
-          className="border rounded-lg p-3 w-full"
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          className="mt-1 w-full rounded border px-3 py-2"
           placeholder="Enjoy!"
         />
-      </label>
+      </div>
 
-      <button className="bg-black text-white rounded-lg p-3 disabled:opacity-60" disabled={loading}>
-        {loading ? 'Redirecting…' : 'Buy with Stripe'}
+      {error && (
+        <div className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-700">
+          {error}
+        </div>
+      )}
+
+      <button
+        type="submit"
+        disabled={loading}
+        className="w-full rounded bg-black px-4 py-2 font-semibold text-white disabled:opacity-50"
+      >
+        {loading ? "Redirecting…" : "Buy with Stripe"}
       </button>
 
-      {msg && <p className="text-red-600">{msg}</p>}
-      <p className="text-xs text-gray-500">You’re buying a gift card for {businessName}.</p>
+      <p className="text-xs text-gray-500">
+        You’re buying a gift card for <strong>{businessName}</strong>.
+      </p>
     </form>
   );
 }

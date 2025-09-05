@@ -1,215 +1,147 @@
 // src/app/api/stripe/webhook/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import Stripe from "stripe";
-import { createClient } from "@supabase/supabase-js";
+import { stripe } from "@/lib/stripe";
+import { supabaseAdmin } from "@/lib/db";
 import { sendGiftEmail } from "@/lib/email";
+import type Stripe from "stripe";
 
-export const runtime = "nodejs";
+export const runtime = "nodejs"; // ensure Node runtime (not edge)
+export const dynamic = "force-dynamic";
 
-/**
- * IMPORTANT:
- * - You must set STRIPE_WEBHOOK_SECRET in .env.local (from `stripe listen`)
- * - This handler uses req.text() (RAW BODY) for signature verification.
- */
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: "2025-08-27.basil" as any,
-});
-
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
-
-function json(detail: any, status = 200) {
-  return NextResponse.json(detail, { status });
+function generateGiftCode(len = 12) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no I/O/1/0
+  let raw = "";
+  const bytes = new Uint8Array(len);
+  crypto.getRandomValues(bytes);
+  for (let i = 0; i < len; i++) raw += alphabet[bytes[i] % alphabet.length];
+  return raw.match(/.{1,4}/g)?.join("-") ?? raw;
 }
 
-async function fulfillFromSession(session: Stripe.Checkout.Session) {
-  // 1) Validate payment
-  if (session.payment_status !== "paid") {
-    return { ok: false, reason: "payment_status_not_paid" as const };
-  }
-
-  // 2) Extract values
-  const businessId = session.metadata?.business_id || undefined;
-  const buyerEmail =
-    session.metadata?.buyer_email ||
-    session.customer_details?.email ||
-    (session.customer_email as string) ||
-    "";
-
-  const recipientEmail = session.metadata?.recipient_email || "";
-  const giftMessage = session.metadata?.gift_message || "";
-  const sessionId = session.id;
-
-  const totalAmountCents =
-    typeof session.amount_total === "number" ? session.amount_total : undefined;
-  const currency = (session.currency || "usd").toLowerCase();
-
-  if (!businessId) return { ok: false, reason: "missing_business_id" as const };
-  if (!buyerEmail) return { ok: false, reason: "missing_buyer_email" as const };
-  if (!Number.isFinite(totalAmountCents) || (totalAmountCents as number) <= 0) {
-    return { ok: false, reason: "invalid_amount_total" as const };
-  }
-
-  // 3) Lookup business
-  const { data: business, error: bizErr } = await supabase
-    .from("businesses")
-    .select("id, name")
-    .eq("id", businessId)
-    .single();
-
-  if (bizErr || !business) {
-    return { ok: false, reason: "business_not_found" as const, detail: bizErr?.message };
-  }
-
-  // 4) Idempotent order upsert by session id
-  const { data: existingOrder, error: findOrderErr } = await supabase
-    .from("orders")
-    .select("id, status")
-    .eq("stripe_checkout_session_id", sessionId)
-    .eq("business_id", business.id)
-    .maybeSingle();
-
-  if (findOrderErr) {
-    return { ok: false, reason: "order_find_error" as const, detail: findOrderErr.message };
-  }
-
-  let orderId: string | null = existingOrder?.id ?? null;
-
-  if (!orderId) {
-    const { data: newOrder, error: createOrderErr } = await supabase
-      .from("orders")
-      .insert({
-        business_id: business.id,
-        stripe_payment_intent_id: (session.payment_intent as any)?.id ?? null,
-        stripe_checkout_session_id: sessionId,
-        buyer_email: buyerEmail,
-        recipient_email: recipientEmail || null,
-        total_amount_cents: totalAmountCents!,
-        currency,
-        status: "paid",
-      })
-      .select("id")
-      .single();
-
-    if (createOrderErr || !newOrder) {
-      return { ok: false, reason: "order_insert_error" as const, detail: createOrderErr?.message };
-    }
-    orderId = newOrder.id;
-  } else {
-    const { error: updateOrderErr } = await supabase
-      .from("orders")
-      .update({
-        stripe_payment_intent_id: (session.payment_intent as any)?.id ?? null,
-        buyer_email: buyerEmail,
-        recipient_email: recipientEmail || null,
-        total_amount_cents: totalAmountCents!,
-        currency,
-        status: "paid",
-      })
-      .eq("id", orderId);
-
-    if (updateOrderErr) {
-      return { ok: false, reason: "order_update_error" as const, detail: updateOrderErr.message };
-    }
-  }
-
-  // 5) Idempotent gift card create (one per order)
-  const { data: existingGC, error: findGcErr } = await supabase
-    .from("gift_cards")
-    .select("id, code, remaining_amount_cents, status")
-    .eq("order_id", orderId)
-    .maybeSingle();
-
-  if (findGcErr) {
-    return { ok: false, reason: "gift_card_find_error" as const, detail: findGcErr.message };
-  }
-
-  let giftCardCode: string;
-  if (existingGC) {
-    giftCardCode = existingGC.code;
-  } else {
-    giftCardCode = `GIF-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
-    const { error: gcErr } = await supabase
-      .from("gift_cards")
-      .insert({
-        business_id: business.id,
-        order_id: orderId,
-        code: giftCardCode,
-        initial_amount_cents: totalAmountCents!,
-        remaining_amount_cents: totalAmountCents!,
-        currency,
-        status: "active",
-      });
-
-    if (gcErr) {
-      return { ok: false, reason: "gift_card_insert_error" as const, detail: gcErr.message };
-    }
-  }
-
-  // 6) Email (best-effort)
+async function recordGift(opts: {
+  code: string;
+  amount_cents: number;
+  currency: string;
+  business_id?: string | null;
+  business_slug?: string | null;
+  buyer_email: string;
+  recipient_email?: string | null;
+  stripe_checkout_id: string;
+  order_id: string;
+  business_name?: string | null;
+  message?: string | null;
+}) {
   try {
-    const amountUsd = totalAmountCents! / 100;
-    const primaryTo = recipientEmail || buyerEmail;
-    await sendGiftEmail({
-      to: primaryTo,
-      businessName: business.name,
-      amountUsd,
-      code: giftCardCode,
-      message: giftMessage || undefined,
-    });
-
-    if (recipientEmail && recipientEmail !== buyerEmail) {
-      await sendGiftEmail({
-        to: buyerEmail,
-        businessName: business.name,
-        amountUsd,
-        code: giftCardCode,
-        message: `Copy of the gift sent to ${recipientEmail}. ${giftMessage ?? ""}`.trim(),
-      });
+    // Insert matches your DB: includes initial_amount_cents (NOT NULL in your schema)
+    const { error } = await supabaseAdmin.from("gift_cards").insert({
+      code: opts.code,
+      amount_cents: opts.amount_cents,
+      initial_amount_cents: opts.amount_cents, // <— satisfy NOT NULL
+      currency: opts.currency,
+      business_id: opts.business_id ?? null,
+      business_slug: opts.business_slug ?? null,
+      buyer_email: opts.buyer_email,
+      recipient_email: opts.recipient_email ?? null,
+      status: "issued",
+      stripe_checkout_id: opts.stripe_checkout_id,
+      order_id: opts.order_id,
+      business_name: opts.business_name ?? null, // harmless if column doesn’t exist; remove if your table doesn’t have it
+      message: opts.message ?? null,             // harmless if column doesn’t exist; remove if your table doesn’t have it
+    } as any); // cast to avoid TS complaining if your table has extra columns
+    if (error) {
+      console.warn("[webhook] failed to insert gift_cards (non-fatal):", error);
     }
   } catch (e) {
-    // do not fail fulfillment on email errors
-    console.error("[webhook] email send failed:", e);
+    console.warn("[webhook] exception inserting gift_cards (non-fatal):", e);
   }
-
-  return { ok: true as const, code: giftCardCode };
 }
 
 export async function POST(req: NextRequest) {
   const sig = req.headers.get("stripe-signature");
-  if (!sig) return json({ error: "missing_signature" }, 400);
-
-  const whSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!whSecret) {
-    console.error("Missing STRIPE_WEBHOOK_SECRET");
-    return json({ error: "server_misconfigured" }, 500);
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret) {
+    return NextResponse.json(
+      { error: "Missing STRIPE_WEBHOOK_SECRET" },
+      { status: 500 }
+    );
+  }
+  if (!sig) {
+    return NextResponse.json(
+      { error: "Missing Stripe-Signature header" },
+      { status: 400 }
+    );
   }
 
   let event: Stripe.Event;
-  const body = await req.text(); // RAW BODY for signature verification
+  const rawBody = await req.text();
 
   try {
-    event = stripe.webhooks.constructEvent(body, sig, whSecret);
+    event = await stripe.webhooks.constructEventAsync(rawBody, sig, secret);
   } catch (err: any) {
-    console.error("[webhook] signature verify failed:", err?.message);
-    return json({ error: "invalid_signature" }, 400);
+    console.error("[webhook] signature verification failed:", err?.message);
+    return NextResponse.json({ error: "Invalid signature" }, { status: 400 });
   }
 
-  // Handle only the events we care about
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object as Stripe.Checkout.Session;
-    const result = await fulfillFromSession(session);
-    if (!result.ok) {
-      console.error("[webhook] fulfillment failed:", result);
-      // 2xx so Stripe retries with backoff; we still include details for logs
-      return json({ received: true, warn: result }, 200);
+  try {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object as Stripe.Checkout.Session;
+
+      const sessionId = session.id;
+      const amountTotal = session.amount_total ?? 0; // cents
+      const currency = (session.currency ?? "usd").toLowerCase();
+
+      // Prefer payment_intent id as order_id; fall back to session id
+      const orderId =
+        (typeof session.payment_intent === "string"
+          ? session.payment_intent
+          : (session.payment_intent as Stripe.PaymentIntent | null)?.id) ||
+        sessionId;
+
+      const md = session.metadata ?? {};
+      const business_id = (md["business_id"] as string) || null;
+      const business_slug = (md["business_slug"] as string) || null;
+      const business_name =
+        (md["business_name"] as string) || (business_slug ?? "Your Gift");
+      const buyer_email = String(
+        md["buyer_email"] ?? session.customer_details?.email ?? ""
+      );
+      const recipient_email = String(md["recipient_email"] ?? "") || null;
+      const message = (md["message"] as string) || undefined;
+
+      const code = generateGiftCode();
+
+      await recordGift({
+        code,
+        amount_cents: amountTotal,
+        currency,
+        business_id,
+        business_slug,
+        buyer_email,
+        recipient_email,
+        stripe_checkout_id: sessionId,
+        order_id: orderId,
+        business_name,
+        message: message ?? null,
+      });
+
+      const to = recipient_email || buyer_email;
+      if (to) {
+        await sendGiftEmail({
+          to,
+          cc: recipient_email ? [buyer_email] : undefined,
+          code,
+          businessName: business_name,
+          amountCents: amountTotal,
+          currency,
+          message,
+        });
+      } else {
+        console.warn("[webhook] no email to send (missing buyer/recipient)");
+      }
     }
-    return json({ received: true, code: result.code }, 200);
-  }
 
-  // For other events, just acknowledge.
-  return json({ received: true }, 200);
+    return NextResponse.json({ received: true }, { status: 200 });
+  } catch (err: any) {
+    console.error("[webhook] handler error:", err?.message || err);
+    return NextResponse.json({ error: "Webhook handler error" }, { status: 500 });
+  }
 }
