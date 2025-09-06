@@ -49,6 +49,7 @@ function toNumber(val: unknown): number | null {
   return null;
 }
 
+// If a numeric key looks like cents, convert to dollars
 function normalizeAmountLike(
   key: string,
   raw: number
@@ -203,19 +204,23 @@ export default async function AdminOverview({
     currency?: string | null;
     business_id?: string | null;
 
-    // app fee & stripe fee (new)
+    // App fee + net/fee (cents columns)
     appFeeCents?: number | null;
     appFeeStripeFeeCents?: number | null;
     appFeeNetCents?: number | null;
+
+    // Merchant side (cents columns)
+    merchantNetCents?: number | null;
+    merchantFeeCents?: number | null;
+
+    // Raw totals (cents) for fallback
+    totalAmountCents?: number | null;
   };
 
   const traces: Trace[] = filteredOrders.map((o: AnyRow) => {
     const amt = pickNumberWithKey(o, AMOUNT_KEYS);
     const fee = pickNumberWithKey(o, SERVICE_FEE_KEYS);
     const com = pickNumberWithKey(o, COMMISSION_KEYS);
-    const appFee = pickNumberWithKey(o, ["application_fee_cents"]);
-    const appFeeStripeFee = pickNumberWithKey(o, ["stripe_app_fee_fee_cents"]);
-    const appFeeNet = pickNumberWithKey(o, ["stripe_app_fee_net_cents"]);
 
     return {
       id: String(o.id ?? o.order_id ?? o.payment_intent_id ?? o.checkout_id ?? "—"),
@@ -236,16 +241,22 @@ export default async function AdminOverview({
       recipient: o.recipient_email ?? o.recipient ?? null,
       currency: o.currency ?? "usd",
       business_id: o.business_id ?? null,
-      appFeeCents: appFee.value,
-      appFeeStripeFeeCents: appFeeStripeFee.value,
-      appFeeNetCents: appFeeNet.value,
+
+      appFeeCents: toNumber(o.application_fee_cents),
+      appFeeStripeFeeCents: toNumber(o.stripe_app_fee_fee_cents),
+      appFeeNetCents: toNumber(o.stripe_app_fee_net_cents),
+
+      merchantNetCents: toNumber(o.merchant_net_cents),
+      merchantFeeCents: toNumber(o.merchant_fee_cents),
+
+      totalAmountCents: toNumber(o.total_amount_cents),
     };
   });
 
   // Gross (from order amount)
   const grossSales = traces.reduce((s, t) => s + t.amount, 0);
 
-  // Platform revenue (previous logic: service + commission from rows OR fallback BPS)
+  // Platform revenue (explicit fees or fallback BPS)
   let serviceFees = traces.reduce((s, t) => s + t.serviceFee, 0);
   let merchantCommission = traces.reduce((s, t) => s + t.commission, 0);
 
@@ -262,38 +273,57 @@ export default async function AdminOverview({
     platformFallback = { applied: true, bps: feeBps };
   }
 
-  // If we have application_fee_cents on rows, prefer summing those (authoritative from Stripe)
-  const sumAppFee = traces
-    .map((t) => t.appFeeCents ?? null)
-    .filter((v): v is number => typeof v === "number")
+  // Prefer app fee (authoritative) if present
+  const sumAppFeeCents = traces
+    .map((t) => (typeof t.appFeeCents === "number" ? t.appFeeCents : null))
+    .filter((v): v is number => v !== null)
     .reduce((a, b) => a + b, 0);
-
-  if (sumAppFee > 0) {
-    platformRevenue = sumAppFee / 100; // app fee is cents
+  if (sumAppFeeCents > 0) {
+    platformRevenue = sumAppFeeCents / 100;
     platformFallback = { applied: false, bps: 0 };
   }
 
   // Net Platform Revenue (after Stripe fee on the application fee)
-  const sumNetAppFee = traces
-    .map((t) => t.appFeeNetCents ?? null)
-    .filter((v): v is number => typeof v === "number")
+  const sumNetAppFeeCents = traces
+    .map((t) => (typeof t.appFeeNetCents === "number" ? t.appFeeNetCents : null))
+    .filter((v): v is number => v !== null)
+    .reduce((a, b) => a + b, 0);
+  const sumFeeOnAppCents = traces
+    .map((t) => (typeof t.appFeeStripeFeeCents === "number" ? t.appFeeStripeFeeCents : null))
+    .filter((v): v is number => v !== null)
     .reduce((a, b) => a + b, 0);
 
   const netPlatformRevenue =
-    sumNetAppFee > 0
-      ? sumNetAppFee / 100
-      : // if we only know app fee and not net, but we do know Stripe took X fee on app fee:
-        (() => {
-          const sumFeeOnApp = traces
-            .map((t) => t.appFeeStripeFeeCents ?? null)
-            .filter((v): v is number => typeof v === "number")
-            .reduce((a, b) => a + b, 0);
-          if (sumAppFee > 0 && sumFeeOnApp >= 0) {
-            return (sumAppFee - sumFeeOnApp) / 100;
-          }
-          // else fall back to platformRevenue (best we have)
-          return platformRevenue;
-        })();
+    sumNetAppFeeCents > 0
+      ? sumNetAppFeeCents / 100
+      : sumAppFeeCents > 0 && sumFeeOnAppCents >= 0
+      ? (sumAppFeeCents - sumFeeOnAppCents) / 100
+      : platformRevenue;
+
+  // Merchant Net Payout
+  // Prefer stored merchant_net_cents; if missing, fallback to (total_amount_cents - application_fee_cents)
+  const sumMerchantNetStoredCents = traces
+    .map((t) => (typeof t.merchantNetCents === "number" ? t.merchantNetCents : null))
+    .filter((v): v is number => v !== null)
+    .reduce((a, b) => a + b, 0);
+
+  // Fallback compute per-order
+  const sumMerchantNetFallbackCents = traces
+    .map((t) => {
+      const total = typeof t.totalAmountCents === "number" ? t.totalAmountCents : null;
+      const appFee = typeof t.appFeeCents === "number" ? t.appFeeCents : null;
+      if (total != null && appFee != null) return Math.max(0, total - appFee);
+      return null;
+    })
+    .filter((v): v is number => v !== null)
+    .reduce((a, b) => a + b, 0);
+
+  const merchantNetPayout =
+    sumMerchantNetStoredCents > 0
+      ? sumMerchantNetStoredCents / 100
+      : sumMerchantNetFallbackCents > 0
+      ? sumMerchantNetFallbackCents / 100
+      : 0;
 
   // Businesses (active count)
   const { data: businesses } = await supabase.from("businesses").select("*").limit(5000);
@@ -332,7 +362,7 @@ export default async function AdminOverview({
   const redemptionRate =
     issuedInRange.length > 0 ? redeemedInRange.length / issuedInRange.length : 0;
 
-  // Activity feed (unchanged from previous step)
+  // Activity (keep as-is: orders + redemptions)
   type ActivityItem =
     | { kind: "order"; id: string; ts: Date; summary: string; sub: string }
     | { kind: "redeem"; id: string; ts: Date; summary: string; sub: string };
@@ -373,6 +403,7 @@ export default async function AdminOverview({
       grossSales,
       platformRevenue,
       netPlatformRevenue,
+      merchantNetPayout,
       activeMerchants,
       redemptionRate,
       ordersCount: traces.length,
@@ -429,9 +460,12 @@ export default async function AdminOverview({
         </div>
 
         <div className="p-6 bg-gray-100 rounded-lg shadow">
-          <h2 className="text-lg font-semibold mb-2 text-gray-900">Active Merchants</h2>
+          <h2 className="text-lg font-semibold mb-2 text-gray-900">Merchant Net Payout</h2>
           <p className="text-2xl font-bold text-gray-900">
-            {stats.kpis.activeMerchants}
+            {formatUSD(stats.kpis.merchantNetPayout)}
+          </p>
+          <p className="text-xs text-gray-600 mt-1">
+            Destination charge: net ≈ total − your app fee
           </p>
         </div>
 
@@ -446,7 +480,7 @@ export default async function AdminOverview({
         </div>
       </section>
 
-      {/* Debug breakdown (unchanged) */}
+      {/* Debug breakdown */}
       {debug && (
         <section className="mb-10">
           <h2 className="text-xl font-semibold mb-3 text-gray-900">Debug: Orders Breakdown</h2>
@@ -503,11 +537,46 @@ export default async function AdminOverview({
               </tbody>
             </table>
           </div>
+          <p className="mt-3 text-xs text-gray-600">
+            Set <code>ADMIN_PLATFORM_FEE_BPS</code> to enable fallback platform revenue when explicit
+            fee fields are missing.
+          </p>
         </section>
       )}
 
-      {/* Recent Activity (unchanged) */}
-      {/* ...same as your current file... */}
+      {/* Recent Activity */}
+      <section className="mb-16">
+        <h2 className="text-xl font-semibold mb-4 text-gray-900">Recent Activity</h2>
+        {activity.length === 0 ? (
+          <div className="p-4 bg-gray-50 rounded border border-gray-200 text-gray-900">
+            No activity in this period.
+          </div>
+        ) : (
+          <ul className="space-y-2">
+            {activity.map((it) => (
+              <li
+                key={`${it.kind}-${it.id}-${it.ts.getTime()}`}
+                className="p-4 bg-white rounded border border-gray-200 flex items-start gap-3"
+              >
+                <div className="mt-0.5 text-lg" aria-hidden>
+                  {it.kind === "order" ? "🧾" : "✅"}
+                </div>
+                <div className="flex-1">
+                  <div className="flex flex-wrap items-center gap-x-2">
+                    <span className="font-medium text-gray-900">{it.summary}</span>
+                    <span className="text-xs text-gray-500">
+                      {it.ts.toLocaleString()}
+                    </span>
+                  </div>
+                  {it.sub ? (
+                    <div className="text-sm text-gray-700 mt-1">{it.sub}</div>
+                  ) : null}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
     </main>
   );
 }
