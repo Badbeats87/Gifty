@@ -1,9 +1,8 @@
 // src/app/dashboard/history/page.tsx
 import * as React from "react";
 
-// Some repos export a *function* `supabaseAdmin()`; others export a pre-made client as default.
-// This import handles both cases gracefully.
-import supabaseAdminDefault, { supabaseAdmin as supabaseAdminFactory } from "@/lib/supabaseAdmin";
+// Fallback creation if we can't load your admin client module(s)
+import { createClient } from "@supabase/supabase-js";
 
 export const dynamic = "force-dynamic";
 
@@ -16,11 +15,50 @@ type RedemptionRow = {
   currency: string;
 };
 
-function getAdminClient(): any {
-  // Prefer the named factory if it exists, else the default export.
-  const candidate: any = (supabaseAdminFactory as any) ?? (supabaseAdminDefault as any);
-  // If it's a function, call it to get a client; otherwise assume it's already a client.
-  return typeof candidate === "function" ? candidate() : candidate;
+async function getAdminClient(): Promise<any> {
+  // 1) Try the common modules you already use in API routes
+  const candidates = [
+    "@/lib/supabaseAdmin",        // most likely in your repo
+    "@/lib/supabaseAdminClient",  // some files used this path earlier
+  ];
+
+  for (const path of candidates) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+      // @ts-ignore dynamic import with alias
+      const mod = await import(path);
+      const def = (mod && "default" in mod ? mod.default : undefined) as any;
+      const named = (mod && (mod.supabaseAdmin || mod.client || mod.admin)) as any;
+
+      // If it's a function factory, call it; if it's already a client, return it.
+      if (typeof named === "function") return named();
+      if (named && typeof named.from === "function") return named;
+      if (typeof def === "function") return def();
+      if (def && typeof def.from === "function") return def;
+    } catch {
+      // try next candidate
+    }
+  }
+
+  // 2) Fallback: construct a service client from env (requires server-side keys)
+  const url =
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    process.env.SUPABASE_URL;
+  const serviceKey =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_SERVICE_KEY;
+
+  if (!url || !serviceKey) {
+    throw new Error(
+      "Could not obtain a Supabase admin client. " +
+        "Tried known modules and fallback creation, but SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY are missing."
+    );
+  }
+
+  return createClient(url, serviceKey, {
+    auth: { persistSession: false },
+    global: { headers: { "X-Client-Info": "gifty-admin-history" } },
+  });
 }
 
 function normalizeCurrency(row: any): string {
@@ -58,25 +96,23 @@ function normalizeAmount(row: any): number {
 }
 
 async function loadRedemptions(): Promise<RedemptionRow[]> {
-  const supabase = getAdminClient();
+  const supabase = await getAdminClient();
 
-  // 1) get latest redemptions from the log table
+  // 1) latest redemptions
   const { data: redemptions, error: redErr } = await supabase
     .from("gift_redemptions")
     .select("code, redeemed_at, redeemed_by")
     .order("redeemed_at", { ascending: false })
     .limit(100);
-
   if (redErr) throw redErr;
   if (!redemptions || redemptions.length === 0) return [];
 
-  // 2) fetch matching gift cards in one go
+  // 2) fetch matching gift cards
   const codes = Array.from(new Set(redemptions.map((r: any) => r.code)));
   const { data: gifts, error: giftErr } = await supabase
     .from("gift_cards")
     .select("*")
     .in("code", codes);
-
   if (giftErr) throw giftErr;
 
   const giftByCode = new Map<string, any>();
