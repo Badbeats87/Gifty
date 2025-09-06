@@ -1,24 +1,66 @@
 // src/app/api/checkout/fulfill/route.ts
 import { NextResponse } from "next/server";
 import supabaseAdmin from "@/lib/supabaseAdminClient";
-import stripeClient from "@/lib/stripe";
 import { sendGiftEmail } from "@/lib/email";
+import Stripe from "stripe";
 
 /**
  * POST /api/checkout/fulfill
  * Body: { session_id: string }
  *
  * Idempotent on session_id:
- *  - If a gift already exists for this session_id, return it (do not mutate the row).
+ *  - If a gift already exists for this session_id, return it (no mutation).
  *  - Else, fetch Stripe Checkout Session, insert a new gift_cards row WITHOUT a code
  *    (DB trigger generates it), then email the recipient with the real code.
  *
- * Assumes you have:
- *  - DB trigger to always set gift_cards.code on INSERT
- *  - UNIQUE INDEX on gift_cards(session_id) WHERE session_id IS NOT NULL
+ * Also: robust Stripe client loader (handles various export styles or falls back to env).
  */
 
 type Body = { session_id?: string };
+
+async function getStripe(): Promise<Stripe> {
+  // Try your local module first, supporting default or named exports.
+  const candidates = ["@/lib/stripe"];
+  for (const path of candidates) {
+    try {
+      // @ts-ignore dynamic alias import at runtime
+      const mod = await import(path);
+      const def: any = mod?.default;
+      const named: any = (mod as any)?.stripe || (mod as any)?.client || (mod as any)?.stripeClient;
+
+      const maybe = def ?? named;
+      if (maybe && typeof maybe === "object" && "checkout" in maybe) {
+        return maybe as Stripe;
+      }
+      // Some repos export a factory: () => new Stripe(...)
+      if (typeof def === "function") {
+        const inst = def();
+        if (inst && typeof (inst as any).checkout === "object") return inst as Stripe;
+      }
+      if (typeof named === "function") {
+        const inst = named();
+        if (inst && typeof (inst as any).checkout === "object") return inst as Stripe;
+      }
+    } catch {
+      // try next
+    }
+  }
+
+  // Fall back to env var
+  const key =
+    process.env.STRIPE_SECRET_KEY ||
+    process.env.STRIPE_API_KEY ||
+    process.env.STRIPE_SECRET;
+  if (!key) {
+    throw new Error(
+      "Stripe client unavailable and STRIPE_SECRET_KEY is not set. Set STRIPE_SECRET_KEY (server) or export a client from '@/lib/stripe'."
+    );
+  }
+  return new Stripe(key, {
+    apiVersion: "2024-06-20",
+    appInfo: { name: "Gifty", version: "1.0.0" },
+  });
+}
 
 function normalizeCurrency(rowOrCode: any): string {
   const cur =
@@ -67,7 +109,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 0) Idempotency: if we already have a gift for this session, return it.
+    // 0) Idempotency: already fulfilled?
     {
       const { data: existing, error } = await supabaseAdmin
         .from("gift_cards")
@@ -88,21 +130,24 @@ export async function POST(req: Request) {
 
         return NextResponse.json({
           ok: true,
+          already: true,
           gift: {
-            code: existing.code || null, // <-- whatever is in the DB
+            code: existing.code || null,
             businessName,
             amount,
             currency,
             email: existing.to_email ?? existing.email ?? null,
             sessionId,
           },
-          already: true,
         });
       }
     }
 
-    // 1) Retrieve the Stripe Checkout Session for details
-    const session = await stripeClient.checkout.sessions.retrieve(sessionId, {
+    // 1) Load Stripe client robustly
+    const stripe = await getStripe();
+
+    // 2) Retrieve the Checkout Session details
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
       expand: ["line_items.data.price.product", "payment_intent"],
     });
 
@@ -114,24 +159,24 @@ export async function POST(req: Request) {
 
     const toEmail =
       session.customer_details?.email ||
+      // @ts-ignore older property
       (session as any).customer_email ||
       (session.metadata && (session.metadata.to_email || session.metadata.email)) ||
       null;
 
-    // Prefer explicit business metadata when present; fall back to names on the product
     const meta = session.metadata || {};
     const businessId = (meta.business_id as string) || null;
     const businessNameMeta =
       (meta.business_name as string) || (meta.merchant_name as string) || null;
 
-    // 2) Insert a brand-new gift row. DO NOT send a "code" — let the DB trigger generate it.
+    // 3) Insert a brand-new gift row — DO NOT set "code"; DB trigger generates it
     const insertPayload: any = {
       session_id: session.id,
       to_email: toEmail,
       business_id: businessId,
       business_name: businessNameMeta,
       amount_minor: amountMinor,
-      currency, // keep uppercase for consistency
+      currency, // keep uppercase
     };
 
     const { data: row, error: insertErr } = await supabaseAdmin
@@ -141,7 +186,7 @@ export async function POST(req: Request) {
       .single();
 
     if (insertErr) {
-      // If we somehow raced and the unique(session_id) fired, fetch the winner
+      // Race on unique(session_id) -> fetch winner
       const { data: winner, error: fetchErr } = await supabaseAdmin
         .from("gift_cards")
         .select("*")
@@ -162,6 +207,7 @@ export async function POST(req: Request) {
 
       return NextResponse.json({
         ok: true,
+        already: true,
         gift: {
           code: winner.code || null,
           businessName: businessName2,
@@ -170,11 +216,10 @@ export async function POST(req: Request) {
           email: winner.to_email ?? winner.email ?? null,
           sessionId,
         },
-        already: true,
       });
     }
 
-    // 3) Email the recipient with the *real* DB-generated code
+    // 4) Email recipient with the real DB-generated code
     const amountMajor = row.amount ?? minorToMajor(row.amount_minor);
     const businessNameFinal =
       businessNameMeta ||
