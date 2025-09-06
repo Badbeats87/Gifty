@@ -23,34 +23,25 @@ function formatDate(d: string | Date | null | undefined) {
 }
 
 /**
- * Higher-contrast pill badges
+ * Solid, high-contrast badges (no ring, no dark variants).
  */
 function Badge({
   tone = "gray",
   children,
 }: {
-  tone?: "green" | "yellow" | "red" | "gray" | "blue";
+  tone?: "green" | "yellow" | "red" | "gray" | "blue" | "black";
   children: React.ReactNode;
 }) {
-  const tones: Record<
-    NonNullable<Parameters<typeof Badge>[0]["tone"]>,
-    string
-  > = {
-    green:
-      "bg-green-50 text-green-700 ring-1 ring-inset ring-green-300 dark:bg-green-900/20 dark:text-green-200 dark:ring-green-700/60",
-    yellow:
-      "bg-yellow-50 text-yellow-800 ring-1 ring-inset ring-yellow-300 dark:bg-yellow-900/20 dark:text-yellow-200 dark:ring-yellow-700/60",
-    red:
-      "bg-red-50 text-red-700 ring-1 ring-inset ring-red-300 dark:bg-red-900/20 dark:text-red-200 dark:ring-red-700/60",
-    gray:
-      "bg-gray-100 text-gray-800 ring-1 ring-inset ring-gray-300 dark:bg-gray-800 dark:text-gray-100 dark:ring-gray-700/80",
-    blue:
-      "bg-blue-50 text-blue-700 ring-1 ring-inset ring-blue-300 dark:bg-blue-900/20 dark:text-blue-200 dark:ring-blue-700/60",
+  const tones: Record<NonNullable<Parameters<typeof Badge>[0]["tone"]>, string> = {
+    green: "bg-green-600 text-white",
+    yellow: "bg-yellow-500 text-black",
+    red: "bg-red-600 text-white",
+    gray: "bg-gray-400 text-black",
+    blue: "bg-blue-600 text-white",
+    black: "bg-gray-900 text-white",
   };
   return (
-    <span
-      className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${tones[tone]}`}
-    >
+    <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${tones[tone]}`}>
       {children}
     </span>
   );
@@ -96,6 +87,7 @@ export default async function AdminMerchants() {
     const name: string = b.name ?? "(Unnamed)";
     const slug: string | null = b.slug ?? null;
 
+    // Stripe connect detection
     const stripeIdCandidates = [
       b.stripe_account_id,
       b.stripe_connect_account_id,
@@ -106,9 +98,11 @@ export default async function AdminMerchants() {
     const stripeAccountId = stripeIdCandidates.find((v) => v.startsWith("acct_")) ?? null;
     const isConnected = Boolean(stripeAccountId);
 
+    // If your schema has explicit flags, prefer those
     const chargesEnabled = Boolean(b.stripe_charges_enabled ?? b.charges_enabled ?? null);
     const payoutsEnabled = Boolean(b.stripe_payouts_enabled ?? b.payouts_enabled ?? null);
 
+    // Status: prefer explicit `status`; else infer; then normalize
     let status: string = "—";
     if (typeof b.status === "string" && b.status.trim().length > 0) {
       status = titleCase(b.status);
@@ -118,6 +112,7 @@ export default async function AdminMerchants() {
       status = "Connected";
     }
 
+    // Active definition for KPI
     const isActive =
       typeof b.status === "string"
         ? b.status.toLowerCase() === "active"
@@ -132,7 +127,7 @@ export default async function AdminMerchants() {
       isConnected,
       chargesEnabled,
       payoutsEnabled,
-      status,
+      status, // e.g., "Connected", "Active", "Pending", "—"
       isActive,
       owner_user_id: b.owner_user_id ?? null,
       contact: b.contact_email ?? b.email ?? null,
@@ -190,76 +185,81 @@ export default async function AdminMerchants() {
                   </Cell>
                 </tr>
               ) : (
-                derived.map((m) => (
-                  <tr key={m.id} className="hover:bg-gray-100">
-                    <Cell>
-                      <div className="flex items-center gap-3">
-                        {m.logo_url ? (
-                          // eslint-disable-next-line @next/next/no-img-element
-                          <img
-                            src={m.logo_url}
-                            alt=""
-                            className="w-8 h-8 rounded object-cover ring-1 ring-gray-200"
-                          />
-                        ) : (
-                          <div className="w-8 h-8 rounded bg-gray-200 flex items-center justify-center text-xs text-gray-600">
-                            {m.name.slice(0, 1).toUpperCase()}
-                          </div>
-                        )}
-                        <div className="min-w-0">
-                          <div className="font-medium text-gray-900 truncate max-w-[220px]">
-                            {m.name}
-                          </div>
-                          <div className="text-xs text-gray-600 truncate max-w-[220px]">
-                            {m.slug ? `/${m.slug}` : m.id}
+                derived.map((m) => {
+                  // Normalize status → tone
+                  const statusLower = (m.status || "—").toString().trim().toLowerCase();
+                  const statusTone =
+                    statusLower === "active"
+                      ? "green"
+                      : statusLower === "pending"
+                      ? "yellow"
+                      : statusLower === "disconnected"
+                      ? "red"
+                      : statusLower === "connected"
+                      ? "green"
+                      : "gray";
+
+                  return (
+                    <tr key={m.id} className="hover:bg-gray-100">
+                      <Cell>
+                        <div className="flex items-center gap-3">
+                          {m.logo_url ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img
+                              src={m.logo_url}
+                              alt=""
+                              className="w-8 h-8 rounded object-cover"
+                            />
+                          ) : (
+                            <div className="w-8 h-8 rounded bg-gray-200 flex items-center justify-center text-xs text-gray-600">
+                              {m.name.slice(0, 1).toUpperCase()}
+                            </div>
+                          )}
+                          <div className="min-w-0">
+                            <div className="font-medium text-gray-900 truncate max-w-[220px]">
+                              {m.name}
+                            </div>
+                            <div className="text-xs text-gray-600 truncate max-w-[220px]">
+                              {m.slug ? `/${m.slug}` : m.id}
+                            </div>
                           </div>
                         </div>
-                      </div>
-                    </Cell>
+                      </Cell>
 
-                    <Cell>
-                      <div className="flex items-center gap-2">
-                        {m.isConnected ? (
-                          <Badge tone="green">Connected</Badge>
-                        ) : (
-                          <Badge tone="gray">Not Connected</Badge>
-                        )}
-                        {m.chargesEnabled && <Badge tone="blue">Charges</Badge>}
-                        {m.payoutsEnabled && <Badge tone="blue">Payouts</Badge>}
-                      </div>
-                      <div className="text-xs text-gray-700 mt-1 truncate max-w-[240px]">
-                        {m.stripeAccountId ?? "—"}
-                      </div>
-                    </Cell>
+                      <Cell>
+                        <div className="flex items-center gap-2">
+                          {m.isConnected ? (
+                            <Badge tone="green">Connected</Badge>
+                          ) : (
+                            <Badge tone="gray">Not Connected</Badge>
+                          )}
+                          {m.chargesEnabled && <Badge tone="blue">Charges</Badge>}
+                          {m.payoutsEnabled && <Badge tone="blue">Payouts</Badge>}
+                        </div>
+                        <div className="text-xs text-gray-700 mt-1 truncate max-w-[240px]">
+                          {m.stripeAccountId ?? "—"}
+                        </div>
+                      </Cell>
 
-                    <Cell>
-                      {m.status === "Active" ? (
-                        <Badge tone="green">Active</Badge>
-                      ) : m.status === "Pending" ? (
-                        <Badge tone="yellow">Pending</Badge>
-                      ) : m.status === "Disconnected" ? (
-                        <Badge tone="red">Disconnected</Badge>
-                      ) : m.status === "Connected" ? (
-                        <Badge tone="green">Connected</Badge>
-                      ) : (
-                        <Badge tone="gray">{m.status || "—"}</Badge>
-                      )}
-                    </Cell>
+                      <Cell>
+                        <Badge tone={statusTone as any}>{m.status || "—"}</Badge>
+                      </Cell>
 
-                    <Cell>{m.contact ?? "—"}</Cell>
+                      <Cell>{m.contact ?? "—"}</Cell>
 
-                    <Cell>{formatDate(m.created_at)}</Cell>
+                      <Cell>{formatDate(m.created_at)}</Cell>
 
-                    <Cell>
-                      <a
-                        href={`/admin/merchants/${m.id}`}
-                        className="text-blue-600 hover:underline"
-                      >
-                        View
-                      </a>
-                    </Cell>
-                  </tr>
-                ))
+                      <Cell>
+                        <a
+                          href={`/admin/merchants/${m.id}`}
+                          className="text-blue-600 hover:underline"
+                        >
+                          View
+                        </a>
+                      </Cell>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>

@@ -1,4 +1,4 @@
-// src/lib/email.ts
+// src/lib/email.tsx
 import { Resend } from "resend";
 import { render } from "@react-email/render";
 import GiftEmail, { GiftEmailProps } from "../emails/GiftEmail";

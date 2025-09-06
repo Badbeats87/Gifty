@@ -1,7 +1,7 @@
 // src/app/api/admin/stripe/backfill-fees/route.ts
 import { NextResponse } from "next/server";
-import { stripe } from "@/src/lib/stripe";
-import { getSupabaseAdmin } from "@/src/lib/supabaseAdmin";
+import { stripe } from "@/lib/stripe";           // ✅ fixed
+import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 
 export async function POST() {
   if (!stripe) return NextResponse.json({ ok: false, error: "Stripe not configured" }, { status: 400 });
