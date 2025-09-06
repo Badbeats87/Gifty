@@ -35,7 +35,7 @@ export default function QRScannerClient() {
         const list = await BrowserMultiFormatReader.listVideoInputDevices();
         if (cancelled) return;
 
-        // Deduplicate in case of repeated entries with blank IDs/labels.
+        // Deduplicate possible blanks/duplicates from some browsers
         const seen = new Set<string>();
         const deduped = list.filter((d) => {
           const key = `${d.deviceId || "unknown"}|${d.label || ""}`;
@@ -46,7 +46,7 @@ export default function QRScannerClient() {
 
         setDevices(deduped);
 
-        // Prefer a rear/back camera if available
+        // Prefer rear camera when available
         const back =
           deduped.find((d) =>
             /back|rear|environment/i.test(`${d.label} ${d.deviceId}`)
@@ -65,7 +65,12 @@ export default function QRScannerClient() {
   }, []);
 
   React.useEffect(() => {
-    // Stop the camera feed if we unmount
+    // Ensure iOS/Safari will actually render the stream
+    if (videoRef.current) {
+      videoRef.current.setAttribute("playsinline", "true");
+      videoRef.current.setAttribute("muted", "true");
+      // autoPlay prop also set on element below
+    }
     return () => {
       controls?.stop();
     };
@@ -78,10 +83,10 @@ export default function QRScannerClient() {
     const hints: string[] = [];
 
     if (!isHttps && !isLocalhost) {
-      hints.push("Camera requires HTTPS (or localhost). Try using https:// on your dev domain.");
+      hints.push("Camera requires HTTPS (or localhost). Use https:// for your dev domain.");
     }
-    hints.push("Grant camera permission in your browser (then click Start scanning again).");
-    hints.push("Or use ‘Scan from image’ below to upload a QR screenshot/photo.");
+    hints.push("Grant camera permission in your browser, then tap Start scanning again.");
+    hints.push("Or use ‘Scan from image…’ to upload a photo/screenshot of the QR.");
 
     const msg = [
       "Unable to access the camera.",
@@ -96,7 +101,7 @@ export default function QRScannerClient() {
   }
 
   function extractCodeFrom(text: string): string {
-    // Try to parse a full URL and extract /card/:code
+    // If it's a URL, pull /card/:code out of the path
     try {
       const u = new URL(text);
       const parts = u.pathname.split("/").filter(Boolean);
@@ -105,9 +110,8 @@ export default function QRScannerClient() {
         return decodeURIComponent(parts[idx + 1]);
       }
     } catch {
-      // not a URL — ignore
+      // not a URL
     }
-    // Otherwise, return the raw text as-is (most QR codes will be the code string)
     return text.trim();
   }
 
@@ -129,13 +133,12 @@ export default function QRScannerClient() {
             const c = extractCodeFrom(text);
             setCode(c);
             setStatus("found");
-            stop(); // stop scanning on first successful decode
+            stop(); // stop on first successful decode
           }
         }
       );
       setControls(nextControls);
     } catch (e: any) {
-      // Most common: NotAllowedError (permission), NotFoundError (no camera), OverconstrainedError
       setStatus("perm");
       setError(explainPermissionIssue(e?.message || String(e)));
       setScanning(false);
@@ -252,7 +255,13 @@ export default function QRScannerClient() {
 
       <div className="aspect-video bg-black/5 rounded-md overflow-hidden flex items-center justify-center">
         {/* eslint-disable @next/next/no-img-element */}
-        <video ref={videoRef} className="w-full h-full object-cover" muted />
+        <video
+          ref={videoRef}
+          className="w-full h-full object-cover"
+          muted
+          autoPlay
+          playsInline
+        />
       </div>
 
       <div className="grid gap-2">
