@@ -10,10 +10,7 @@ type PageProps = {
 };
 
 async function getAdminClient(): Promise<any> {
-  const candidates = [
-    "@/lib/supabaseAdmin",
-    "@/lib/supabaseAdminClient",
-  ];
+  const candidates = ["@/lib/supabaseAdmin", "@/lib/supabaseAdminClient"];
 
   for (const path of candidates) {
     try {
@@ -101,7 +98,7 @@ function parseQuery(searchParams?: PageProps["searchParams"]): string {
 async function loadRedemptions(range: "7" | "30" | "90" | "all"): Promise<RedemptionRow[]> {
   const supabase = await getAdminClient();
 
-  // Build time filter
+  // 1) gift_redemptions (optionally time-filtered)
   let query = supabase
     .from("gift_redemptions")
     .select("code, redeemed_at, redeemed_by")
@@ -118,6 +115,7 @@ async function loadRedemptions(range: "7" | "30" | "90" | "all"): Promise<Redemp
   if (redErr) throw redErr;
   if (!redemptions || redemptions.length === 0) return [];
 
+  // 2) fetch gift_cards for details
   const codes = Array.from(new Set(redemptions.map((r: any) => r.code)));
   const { data: gifts, error: giftErr } = await supabase
     .from("gift_cards")
@@ -125,13 +123,34 @@ async function loadRedemptions(range: "7" | "30" | "90" | "all"): Promise<Redemp
     .in("code", codes);
   if (giftErr) throw giftErr;
 
+  // 3) fetch businesses for names (when gift row doesn't carry it)
+  const businessIds = Array.from(
+    new Set((gifts || []).map((g: any) => g.business_id).filter(Boolean))
+  );
+  let businessesById = new Map<string, string>();
+  if (businessIds.length > 0) {
+    const { data: businesses, error: bizErr } = await supabase
+      .from("businesses")
+      .select("id, name")
+      .in("id", businessIds);
+    if (bizErr) throw bizErr;
+    businessesById = new Map(
+      (businesses || []).map((b: any) => [String(b.id), b.name as string])
+    );
+  }
+
   const giftByCode = new Map<string, any>();
   for (const g of gifts || []) giftByCode.set(g.code, g);
 
+  // 4) join + normalize
   return redemptions.map((r: any) => {
     const g = giftByCode.get(r.code) || {};
     const businessName =
-      g.business_name ?? g.business ?? g.merchant_name ?? "Business";
+      businessesById.get(String(g.business_id)) ??
+      g.business_name ??
+      g.business ??
+      g.merchant_name ??
+      "Business";
     const amount = normalizeAmount(g);
     const currency = normalizeCurrency(g);
     return {
