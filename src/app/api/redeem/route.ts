@@ -10,24 +10,32 @@ import supabaseAdmin from "@/lib/supabaseAdminClient";
  *  - Finds the gift by code
  *  - If already redeemed, returns a clear message (idempotent)
  *  - Otherwise attempts RPC "redeem_gift_card(p_code text)" if present
- *    and gracefully falls back to direct updates when the function is missing.
+ *    and gracefully falls back through common columns:
+ *      1) redeemed_at (timestamp)
+ *      2) redeemed (boolean)
+ *      3) is_redeemed (boolean)
+ *      4) used_at (timestamp)
  *  - Responds with normalized details: code, amount, currency, businessName, redeemedAt
  */
 
 type Body = { code?: string };
 
 function isMissingColumn(err: any) {
+  // Handle Postgres error code + Supabase "schema cache" phrasing
   const msg = `${err?.message || ""} ${err?.details || ""}`.toLowerCase();
-  return err?.code === "42703" || msg.includes("does not exist") && msg.includes("column");
+  return (
+    err?.code === "42703" || // undefined_column
+    (msg.includes("could not find") && msg.includes("column")) ||
+    msg.includes("schema cache") // Supabase specific phrasing
+  );
 }
 
 function isUndefinedFunction(err: any) {
   const msg = `${err?.message || ""} ${err?.details || ""}`.toLowerCase();
-  // Postgres undefined_function is 42883. Supabase sometimes surfaces a
-  // friendlier message like "Could not find the function ... in the schema cache".
+  // Postgres undefined_function is 42883; Supabase may say "schema cache"
   return (
     err?.code === "42883" ||
-    msg.includes("function") && msg.includes("does not exist") ||
+    (msg.includes("function") && msg.includes("does not exist")) ||
     msg.includes("could not find the function") ||
     msg.includes("schema cache")
   );
@@ -74,7 +82,9 @@ function normalizeAmount(row: any): number {
 function alreadyRedeemed(row: any): boolean {
   if (row?.redeemed === true) return true;
   if (row?.is_redeemed === true) return true;
+  if (row?.used === true) return true;
   if (row?.redeemed_at) return true;
+  if (row?.used_at) return true;
   return false;
 }
 
@@ -90,56 +100,93 @@ async function findGiftByCode(code: string) {
   return data || null;
 }
 
+async function tryUpdateRedeemedAt(id: any) {
+  const { data, error } = await supabaseAdmin
+    .from("gift_cards")
+    .update({ redeemed_at: new Date().toISOString() })
+    .eq("id", id)
+    .select("*")
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function tryUpdateBoolean(id: any, col: "redeemed" | "is_redeemed" | "used") {
+  const { data, error } = await supabaseAdmin
+    .from("gift_cards")
+    .update({ [col]: true } as any)
+    .eq("id", id)
+    .select("*")
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function tryUpdateUsedAt(id: any) {
+  const { data, error } = await supabaseAdmin
+    .from("gift_cards")
+    .update({ used_at: new Date().toISOString() })
+    .eq("id", id)
+    .select("*")
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
 async function ensureRedeemed(row: any) {
-  // Try RPC first if present
+  // 0) Try RPC first if present
   try {
     const rpc = await supabaseAdmin.rpc("redeem_gift_card", { p_code: row.code });
     if (rpc.error) {
-      if (isUndefinedFunction(rpc.error)) {
-        // Missing RPC -> fall back silently
-      } else {
-        throw rpc.error;
-      }
+      if (!isUndefinedFunction(rpc.error)) throw rpc.error;
+      // else: missing RPC → fall through to column updates
     } else {
-      // RPC worked, refetch latest row
       const refreshed = await findGiftByCode(row.code);
       return refreshed || row;
     }
   } catch (e: any) {
     if (!isUndefinedFunction(e)) {
-      // Real error, not just "function missing"
       throw e;
     }
-    // Else: swallow and fall through to SQL fallback
+    // else: fall through
   }
 
-  // Fallback: set redeemed_at = now() if that column exists
+  // 1) redeemed_at
   try {
-    const { data, error } = await supabaseAdmin
-      .from("gift_cards")
-      .update({ redeemed_at: new Date().toISOString() })
-      .eq("id", row.id)
-      .is("redeemed_at", null)
-      .select("*")
-      .maybeSingle();
-
-    if (error) throw error;
-    return data || row;
+    const updated = await tryUpdateRedeemedAt(row.id);
+    if (updated) return updated;
   } catch (e: any) {
-    // If redeemed_at column doesn't exist, try a boolean flag
-    if (isMissingColumn(e)) {
-      const { data, error } = await supabaseAdmin
-        .from("gift_cards")
-        .update({ redeemed: true })
-        .eq("id", row.id)
-        .eq("redeemed", false)
-        .select("*")
-        .maybeSingle();
-      if (error) throw error;
-      return data || row;
-    }
-    throw e;
+    if (!isMissingColumn(e)) throw e;
   }
+
+  // 2) redeemed (boolean)
+  try {
+    const updated = await tryUpdateBoolean(row.id, "redeemed");
+    if (updated) return updated;
+  } catch (e: any) {
+    if (!isMissingColumn(e)) throw e;
+  }
+
+  // 3) is_redeemed (boolean)
+  try {
+    const updated = await tryUpdateBoolean(row.id, "is_redeemed");
+    if (updated) return updated;
+  } catch (e: any) {
+    if (!isMissingColumn(e)) throw e;
+  }
+
+  // 4) used_at
+  try {
+    const updated = await tryUpdateUsedAt(row.id);
+    if (updated) return updated;
+  } catch (e: any) {
+    if (!isMissingColumn(e)) throw e;
+  }
+
+  // No known column found to mark redemption
+  throw new Error(
+    "No known redemption column found (tried: redeemed_at, redeemed, is_redeemed, used_at)."
+  );
 }
 
 async function findBusinessName(businessId: any) {
@@ -173,7 +220,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // If already redeemed, surface as idempotent success-ish response
+    // Idempotent: already redeemed?
     if (alreadyRedeemed(row)) {
       const businessName = await findBusinessName(row.business_id);
       const currency = normalizeCurrency(row);
@@ -186,12 +233,12 @@ export async function POST(req: Request) {
           amount,
           currency,
           businessName: businessName || row.business_name || "Business",
-          redeemedAt: row.redeemed_at || null,
+          redeemedAt: row.redeemed_at || row.used_at || null,
         },
       });
     }
 
-    // Attempt to redeem now (RPC or fallback)
+    // Attempt to redeem now
     const updated = await ensureRedeemed(row);
     const businessName = await findBusinessName(updated.business_id);
     const currency = normalizeCurrency(updated);
@@ -204,7 +251,7 @@ export async function POST(req: Request) {
         amount,
         currency,
         businessName: businessName || updated.business_name || "Business",
-        redeemedAt: updated.redeemed_at || new Date().toISOString(),
+        redeemedAt: updated.redeemed_at || updated.used_at || new Date().toISOString(),
       },
     });
   } catch (err: any) {
