@@ -253,17 +253,23 @@ export default async function AdminOverview({
     };
   });
 
-  // Gross (from order amount)
-  const grossSales = traces.reduce((s, t) => s + t.amount, 0);
+  // --- KPI traces: only orders that belong to the real Gifty flow (have app fee)
+  const kpiTraces = traces.filter((t) => typeof t.appFeeCents === "number");
+  const excludedCount = traces.length - kpiTraces.length;
 
-  // Platform revenue (explicit fees or fallback BPS)
-  let serviceFees = traces.reduce((s, t) => s + t.serviceFee, 0);
-  let merchantCommission = traces.reduce((s, t) => s + t.commission, 0);
+  // Gross (from order amount) — ONLY from kpiTraces
+  const grossSales = kpiTraces.reduce((s, t) => s + t.amount, 0);
+
+  // Platform revenue (explicit fees or fallback BPS) — only over kpiTraces
+  let serviceFees = kpiTraces.reduce((s, t) => s + t.serviceFee, 0);
+  let merchantCommission = kpiTraces.reduce((s, t) => s + t.commission, 0);
 
   const feeBpsEnv = process.env.ADMIN_PLATFORM_FEE_BPS;
   const feeBps = feeBpsEnv ? Number(feeBpsEnv) : 0;
   const haveExplicitFees =
-    serviceFees > 0 || merchantCommission > 0 || traces.some((t) => t.serviceKey || t.commissionKey);
+    serviceFees > 0 ||
+    merchantCommission > 0 ||
+    kpiTraces.some((t) => t.serviceKey || t.commissionKey);
 
   let platformRevenue = serviceFees + merchantCommission;
   let platformFallback: { applied: boolean; bps: number } = { applied: false, bps: 0 };
@@ -273,8 +279,8 @@ export default async function AdminOverview({
     platformFallback = { applied: true, bps: feeBps };
   }
 
-  // Prefer app fee (authoritative) if present
-  const sumAppFeeCents = traces
+  // Prefer authoritative app fee if present
+  const sumAppFeeCents = kpiTraces
     .map((t) => (typeof t.appFeeCents === "number" ? t.appFeeCents : null))
     .filter((v): v is number => v !== null)
     .reduce((a, b) => a + b, 0);
@@ -284,11 +290,11 @@ export default async function AdminOverview({
   }
 
   // Net Platform Revenue (after Stripe fee on the application fee)
-  const sumNetAppFeeCents = traces
+  const sumNetAppFeeCents = kpiTraces
     .map((t) => (typeof t.appFeeNetCents === "number" ? t.appFeeNetCents : null))
     .filter((v): v is number => v !== null)
     .reduce((a, b) => a + b, 0);
-  const sumFeeOnAppCents = traces
+  const sumFeeOnAppCents = kpiTraces
     .map((t) => (typeof t.appFeeStripeFeeCents === "number" ? t.appFeeStripeFeeCents : null))
     .filter((v): v is number => v !== null)
     .reduce((a, b) => a + b, 0);
@@ -300,15 +306,13 @@ export default async function AdminOverview({
       ? (sumAppFeeCents - sumFeeOnAppCents) / 100
       : platformRevenue;
 
-  // Merchant Net Payout
-  // Prefer stored merchant_net_cents; if missing, fallback to (total_amount_cents - application_fee_cents)
-  const sumMerchantNetStoredCents = traces
+  // Merchant Net Payout — prefer stored; fallback to total − app fee (only when both present)
+  const sumMerchantNetStoredCents = kpiTraces
     .map((t) => (typeof t.merchantNetCents === "number" ? t.merchantNetCents : null))
     .filter((v): v is number => v !== null)
     .reduce((a, b) => a + b, 0);
 
-  // Fallback compute per-order
-  const sumMerchantNetFallbackCents = traces
+  const sumMerchantNetFallbackCents = kpiTraces
     .map((t) => {
       const total = typeof t.totalAmountCents === "number" ? t.totalAmountCents : null;
       const appFee = typeof t.appFeeCents === "number" ? t.appFeeCents : null;
@@ -362,7 +366,7 @@ export default async function AdminOverview({
   const redemptionRate =
     issuedInRange.length > 0 ? redeemedInRange.length / issuedInRange.length : 0;
 
-  // Activity (keep as-is: orders + redemptions)
+  // Activity (orders + redemptions) — show ALL traces, including excluded
   type ActivityItem =
     | { kind: "order"; id: string; ts: Date; summary: string; sub: string }
     | { kind: "redeem"; id: string; ts: Date; summary: string; sub: string };
@@ -406,11 +410,12 @@ export default async function AdminOverview({
       merchantNetPayout,
       activeMerchants,
       redemptionRate,
-      ordersCount: traces.length,
+      ordersCount: kpiTraces.length, // only real orders in KPI count
       issuedCards: issuedInRange.length,
       redeemedCards: redeemedInRange.length,
     },
     platformFallback,
+    excludedCount,
   };
 
   return (
@@ -433,7 +438,18 @@ export default async function AdminOverview({
           <p className="text-2xl font-bold text-gray-900">
             {formatUSD(stats.kpis.grossSales)}
           </p>
-          <p className="text-xs text-gray-600 mt-1">{stats.kpis.ordersCount} orders</p>
+          <p className="text-xs text-gray-600 mt-1">
+            {stats.kpis.ordersCount} orders
+            {stats.excludedCount > 0 ? (
+              <>
+                {" "}
+                <span className="text-gray-400">•</span>{" "}
+                <span className="text-gray-500">
+                  {stats.excludedCount} test/unsupported orders excluded
+                </span>
+              </>
+            ) : null}
+          </p>
         </div>
 
         <div className="p-6 bg-gray-100 rounded-lg shadow">
@@ -480,7 +496,7 @@ export default async function AdminOverview({
         </div>
       </section>
 
-      {/* Debug breakdown */}
+      {/* Debug breakdown (ALL orders in period) */}
       {debug && (
         <section className="mb-10">
           <h2 className="text-xl font-semibold mb-3 text-gray-900">Debug: Orders Breakdown</h2>
@@ -538,13 +554,12 @@ export default async function AdminOverview({
             </table>
           </div>
           <p className="mt-3 text-xs text-gray-600">
-            Set <code>ADMIN_PLATFORM_FEE_BPS</code> to enable fallback platform revenue when explicit
-            fee fields are missing.
+            KPIs exclude orders without an application fee (e.g., test PI fixtures).
           </p>
         </section>
       )}
 
-      {/* Recent Activity */}
+      {/* Recent Activity (ALL orders/redemptions) */}
       <section className="mb-16">
         <h2 className="text-xl font-semibold mb-4 text-gray-900">Recent Activity</h2>
         {activity.length === 0 ? (
