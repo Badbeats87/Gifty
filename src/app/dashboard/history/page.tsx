@@ -5,6 +5,10 @@ import HistoryClient, { type RedemptionRow } from "./HistoryClient";
 
 export const dynamic = "force-dynamic";
 
+type PageProps = {
+  searchParams?: Record<string, string | string[] | undefined>;
+};
+
 async function getAdminClient(): Promise<any> {
   const candidates = [
     "@/lib/supabaseAdmin",
@@ -79,14 +83,33 @@ function normalizeAmount(row: any): number {
   return 0;
 }
 
-async function loadRedemptions(): Promise<RedemptionRow[]> {
+function parseRange(searchParams?: PageProps["searchParams"]): "7" | "30" | "90" | "all" {
+  const raw = (searchParams?.range ?? searchParams?.["range"]) as
+    | string
+    | string[]
+    | undefined;
+  const val = Array.isArray(raw) ? raw[0] : raw;
+  if (val === "7" || val === "30" || val === "90" || val === "all") return val;
+  return "30"; // default
+}
+
+async function loadRedemptions(range: "7" | "30" | "90" | "all"): Promise<RedemptionRow[]> {
   const supabase = await getAdminClient();
 
-  const { data: redemptions, error: redErr } = await supabase
+  // Build time filter
+  let query = supabase
     .from("gift_redemptions")
     .select("code, redeemed_at, redeemed_by")
     .order("redeemed_at", { ascending: false })
     .limit(100);
+
+  if (range !== "all") {
+    const days = Number(range);
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    query = query.gte("redeemed_at", since);
+  }
+
+  const { data: redemptions, error: redErr } = await query;
   if (redErr) throw redErr;
   if (!redemptions || redemptions.length === 0) return [];
 
@@ -117,12 +140,13 @@ async function loadRedemptions(): Promise<RedemptionRow[]> {
   });
 }
 
-export default async function HistoryPage() {
+export default async function HistoryPage(props: PageProps) {
+  const range = parseRange(props.searchParams);
   let rows: RedemptionRow[] = [];
   let loadError: string | null = null;
 
   try {
-    rows = await loadRedemptions();
+    rows = await loadRedemptions(range);
   } catch (e: any) {
     loadError = e?.message || String(e);
   }
@@ -136,12 +160,17 @@ export default async function HistoryPage() {
           Couldn’t load redemptions: {loadError}
         </div>
       ) : rows.length === 0 ? (
-        <div className="mt-4 rounded-md border p-3 text-gray-600">
-          No redemptions yet.
-        </div>
+        <>
+          <HistoryClient rows={rows} range={range} />
+          <div className="mt-4 rounded-md border p-3 text-gray-600">
+            No redemptions in this range.
+          </div>
+        </>
       ) : (
         <>
-          <div className="mt-6 overflow-x-auto rounded-xl border">
+          <HistoryClient rows={rows} range={range} />
+
+          <div className="mt-4 overflow-x-auto rounded-xl border">
             <table className="min-w-full text-sm">
               <thead className="bg-gray-50 text-left">
                 <tr>
@@ -184,15 +213,12 @@ export default async function HistoryPage() {
               </tbody>
             </table>
           </div>
-
-          {/* CSV export button */}
-          <HistoryClient rows={rows} />
         </>
       )}
 
       <p className="mt-3 text-xs text-gray-500">
-        Showing up to the 100 most recent redemptions. This list updates as new
-        redemptions are logged.
+        Filter by date range and export CSV of up to the 100 most recent
+        redemptions in view.
       </p>
     </div>
   );
