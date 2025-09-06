@@ -2,32 +2,9 @@
 import DateFilters from "./DateFilters";
 import { getSupabaseAdmin } from "../../../lib/supabaseAdmin";
 
-// ---------- types ----------
-type OrderRow = {
-  amount_usd?: number | null;
-  amount?: number | null;
-  service_fee_usd?: number | null;
-  merchant_commission_usd?: number | null;
-  created_at?: string | null;
-};
-
-type BusinessRow = {
-  id: string;
-  status?: string | null;
-  stripe_charges_enabled?: boolean | null;
-  stripe_payouts_enabled?: boolean | null;
-  created_at?: string | null;
-};
-
-type GiftCardRow = {
-  id: string;
-  status?: string | null;
-  issued_at?: string | null;
-  redeemed_at?: string | null;
-  created_at?: string | null;
-};
-
 // ---------- helpers ----------
+type AnyRow = Record<string, any>;
+
 function parseDateOnly(d: string | null | undefined): Date | null {
   if (!d) return null;
   const iso = /^\d{4}-\d{2}-\d{2}$/;
@@ -45,12 +22,118 @@ function defaultRange(): { from: Date; to: Date } {
   return { from, to };
 }
 
+function pickTimestamp(row: AnyRow): string | null {
+  return (
+    row.created_at ??
+    row.inserted_at ??
+    row.paid_at ??
+    row.timestamp ??
+    row.createdAt ??
+    null
+  );
+}
+
 function inRange(ts: string | null | undefined, from: Date, to: Date): boolean {
   if (!ts) return false;
   const d = new Date(ts);
   if (isNaN(+d)) return false;
   return d >= from && d <= to;
 }
+
+function toNumber(val: unknown): number | null {
+  if (typeof val === "number" && !Number.isNaN(val)) return val;
+  if (typeof val === "string") {
+    const n = Number(val);
+    if (!Number.isNaN(n)) return n;
+  }
+  return null;
+}
+
+// Heuristic: treat large integers for amount-like keys as cents.
+function normalizeAmountLike(key: string, raw: number): { value: number; centsApplied: boolean } {
+  const k = key.toLowerCase();
+  const looksLikeCentsKey =
+    k.includes("cents") ||
+    k.endsWith("_amount") ||
+    k.includes("amount") ||
+    k.includes("total") ||
+    k.includes("fee") ||
+    k.includes("commission") ||
+    k.includes("application_fee");
+  const isInteger = Number.isInteger(raw);
+  if (looksLikeCentsKey && isInteger && Math.abs(raw) >= 1000) {
+    return { value: raw / 100, centsApplied: true };
+  }
+  return { value: raw, centsApplied: false };
+}
+
+type PickResult = { value: number | null; key: string | null; centsApplied: boolean; raw?: number | null };
+
+function pickNumberWithKey(row: AnyRow, candidates: string[]): PickResult {
+  for (const key of candidates) {
+    if (key in row) {
+      const n = toNumber(row[key]);
+      if (n !== null) {
+        const norm = normalizeAmountLike(key, n);
+        return { value: norm.value, key, centsApplied: norm.centsApplied, raw: n };
+      }
+    }
+    const centsKey = key.endsWith("_cents") ? key : `${key}_cents`;
+    if (centsKey in row) {
+      const n = toNumber(row[centsKey]);
+      if (n !== null) return { value: n / 100, key: centsKey, centsApplied: true, raw: n };
+    }
+  }
+  return { value: null, key: null, centsApplied: false };
+}
+
+const AMOUNT_KEYS = [
+  "amount_usd",
+  "amount",
+  "total_usd",
+  "total",
+  "gross_usd",
+  "gross",
+  "price_usd",
+  "price",
+  "amount_total",
+  "total_amount",
+  "subtotal",
+  "subtotal_usd",
+  "net",
+  "paid_amount",
+  "application_amount",
+  "currency_amount",
+  "amount_cents",
+  "total_cents",
+  "amount_paid",
+  "total_amount_cents",
+];
+
+const SERVICE_FEE_KEYS = [
+  "service_fee_usd",
+  "service_fee",
+  "fee_usd",
+  "fee",
+  "customer_fee_usd",
+  "customer_fee",
+  "platform_fee_usd",
+  "platform_fee",
+  "application_fee_usd",
+  "application_fee",
+  "application_fee_amount",
+  "platform_fee_cents",
+  "application_fee_cents",
+];
+
+const COMMISSION_KEYS = [
+  "merchant_commission_usd",
+  "merchant_commission",
+  "commission_usd",
+  "commission",
+  "seller_fee_usd",
+  "seller_fee",
+];
 
 function formatUSD(n: number) {
   try {
@@ -66,9 +149,9 @@ function formatUSD(n: number) {
 
 // ---------- server page ----------
 export default async function AdminOverview({
-  // Next.js 15: searchParams is async
   searchParams,
 }: {
+  // Next.js 15: searchParams is async
   searchParams: Promise<Record<string, string | undefined>>;
 }) {
   const sp = await searchParams;
@@ -87,101 +170,122 @@ export default async function AdminOverview({
     return def;
   })();
 
-  let error: string | null = null;
+  const debug = sp.debug === "1";
 
   // ---- ORDERS
-  const { data: orders, error: ordersErr } = await supabase
-    .from("orders")
-    .select(
-      "amount_usd, amount, service_fee_usd, merchant_commission_usd, created_at"
-    )
-    .limit(5000);
-
-  if (ordersErr) error = `orders: ${ordersErr.message}`;
-
-  const filteredOrders: OrderRow[] = (orders ?? []).filter((o) =>
-    inRange(o.created_at ?? null, range.from, range.to)
+  const { data: orders } = await supabase.from("orders").select("*").limit(5000);
+  const filteredOrders: AnyRow[] = (orders ?? []).filter((o) =>
+    inRange(pickTimestamp(o), range.from, range.to)
   );
 
-  const grossSales = filteredOrders.reduce((sum, o) => {
-    const amt =
-      typeof o.amount_usd === "number"
-        ? o.amount_usd
-        : typeof o.amount === "number"
-        ? o.amount
-        : 0;
-    return sum + (amt ?? 0);
-  }, 0);
+  type Trace = {
+    id: string;
+    ts: string | null;
+    amount: number;
+    amountKey: string | null;
+    amountRaw: number | null | undefined;
+    amountCents: boolean;
+    serviceFee: number;
+    serviceKey: string | null;
+    serviceRaw: number | null | undefined;
+    serviceCents: boolean;
+    commission: number;
+    commissionKey: string | null;
+    commissionRaw: number | null | undefined;
+    commissionCents: boolean;
+  };
 
-  const serviceFees = filteredOrders.reduce(
-    (sum, o) => sum + (o.service_fee_usd ?? 0),
-    0
-  );
-  const merchantCommission = filteredOrders.reduce(
-    (sum, o) => sum + (o.merchant_commission_usd ?? 0),
-    0
-  );
-  const platformRevenue = serviceFees + merchantCommission;
+  const traces: Trace[] = filteredOrders.map((o: AnyRow) => {
+    const amt = pickNumberWithKey(o, AMOUNT_KEYS);
+    const fee = pickNumberWithKey(o, SERVICE_FEE_KEYS);
+    const com = pickNumberWithKey(o, COMMISSION_KEYS);
+    return {
+      id: String(o.id ?? o.order_id ?? o.payment_intent_id ?? o.checkout_id ?? "—"),
+      ts: pickTimestamp(o),
+      amount: amt.value ?? 0,
+      amountKey: amt.key,
+      amountRaw: amt.raw,
+      amountCents: amt.centsApplied,
+      serviceFee: fee.value ?? 0,
+      serviceKey: fee.key,
+      serviceRaw: fee.raw,
+      serviceCents: fee.centsApplied,
+      commission: com.value ?? 0,
+      commissionKey: com.key,
+      commissionRaw: com.raw,
+      commissionCents: com.centsApplied,
+    };
+  });
 
-  // ---- BUSINESSES
-  const { data: businesses, error: bizErr } = await supabase
-    .from("businesses")
-    .select(
-      "id, status, stripe_charges_enabled, stripe_payouts_enabled, created_at"
-    )
-    .limit(5000);
+  const grossSales = traces.reduce((s, t) => s + t.amount, 0);
+  let serviceFees = traces.reduce((s, t) => s + t.serviceFee, 0);
+  let merchantCommission = traces.reduce((s, t) => s + t.commission, 0);
 
-  if (bizErr) error = error ?? `businesses: ${bizErr.message}`;
+  // ---- Platform revenue fallback (if no explicit fees/commissions)
+  // ADMIN_PLATFORM_FEE_BPS = e.g. 500 (== 5.00%)
+  const feeBpsEnv = process.env.ADMIN_PLATFORM_FEE_BPS;
+  const feeBps = feeBpsEnv ? Number(feeBpsEnv) : 0;
+  const haveExplicitFees =
+    serviceFees > 0 || merchantCommission > 0 || traces.some((t) => t.serviceKey || t.commissionKey);
 
-  const activeMerchants =
-    (businesses as BusinessRow[] | null)?.filter((b) => {
-      const isActiveStatus = (b.status ?? "").toLowerCase() === "active";
-      const stripeReady = !!(b.stripe_charges_enabled && b.stripe_payouts_enabled);
-      // If you don't track these columns yet, treat every row as active
-      if (
-        b.status == null &&
-        b.stripe_charges_enabled == null &&
-        b.stripe_payouts_enabled == null
-      )
-        return true;
-      return isActiveStatus || stripeReady;
-    }).length ?? 0;
+  let platformRevenue = serviceFees + merchantCommission;
+  let fallbackInfo: { applied: boolean; bps: number; computed: number } = {
+    applied: false,
+    bps: 0,
+    computed: 0,
+  };
 
-  // ---- GIFT CARDS
-  const { data: giftCards, error: cardsErr } = await supabase
-    .from("gift_cards")
-    .select("id, status, issued_at, redeemed_at, created_at")
-    .limit(8000);
+  if (!haveExplicitFees && grossSales > 0 && feeBps > 0) {
+    const computed = (grossSales * feeBps) / 10000;
+    platformRevenue = computed;
+    fallbackInfo = { applied: true, bps: feeBps, computed };
+  }
 
-  if (cardsErr) error = error ?? `gift_cards: ${cardsErr.message}`;
+  // ---- BUSINESSES (active count)
+  const { data: businesses } = await supabase.from("businesses").select("*").limit(5000);
+  const businessRows: AnyRow[] = (businesses ?? []) as AnyRow[];
+  const haveStatusOrStripe =
+    businessRows.some((b) => "status" in b) ||
+    businessRows.some(
+      (b) => "stripe_charges_enabled" in b || "stripe_payouts_enabled" in b
+    );
+  const activeMerchants = haveStatusOrStripe
+    ? businessRows.filter((b) => {
+        const isActiveStatus =
+          typeof b.status === "string" && b.status.toLowerCase() === "active";
+        const stripeReady = !!(b.stripe_charges_enabled && b.stripe_payouts_enabled);
+        return isActiveStatus || stripeReady;
+      }).length
+    : businessRows.length;
 
+  // ---- GIFT CARDS (redemption rate)
+  const { data: giftCards } = await supabase.from("gift_cards").select("*").limit(8000);
   const issuedInRange =
-    (giftCards as GiftCardRow[] | null)?.filter((g) => {
-      const ts = g.issued_at ?? g.created_at ?? null;
-      return inRange(ts, range.from, range.to);
-    }) ?? [];
-
-  const redeemedInRange = issuedInRange.filter((g) => {
-    const isRedeemedStatus = (g.status ?? "").toLowerCase() === "redeemed";
+    (giftCards ?? []).filter((g: AnyRow) =>
+      inRange(
+        g.issued_at ?? g.created_at ?? g.purchased_at ?? g.updated_at ?? null,
+        range.from,
+        range.to
+      )
+    ) ?? [];
+  const redeemedInRange = issuedInRange.filter((g: AnyRow) => {
+    const status = (g.status ?? g.state ?? "").toString().toLowerCase();
+    const isRedeemedStatus = status === "redeemed";
     const hasRedeemedAt =
       !!g.redeemed_at && inRange(g.redeemed_at, range.from, range.to);
     return isRedeemedStatus || hasRedeemedAt;
   });
-
   const redemptionRate =
     issuedInRange.length > 0 ? redeemedInRange.length / issuedInRange.length : 0;
 
   const stats = {
-    period: {
-      from: range.from.toISOString(),
-      to: range.to.toISOString(),
-    },
+    period: { from: range.from.toISOString(), to: range.to.toISOString() },
     kpis: {
       grossSales,
       platformRevenue,
       activeMerchants,
       redemptionRate,
-      ordersCount: filteredOrders.length,
+      ordersCount: traces.length,
       issuedCards: issuedInRange.length,
       redeemedCards: redeemedInRange.length,
     },
@@ -201,12 +305,6 @@ export default async function AdminOverview({
         ).toLocaleDateString()}`}
       </p>
 
-      {error ? (
-        <div className="p-4 bg-yellow-50 border border-yellow-200 rounded text-yellow-900 mb-8">
-          Loaded with partial data. Details: <span className="font-mono">{error}</span>
-        </div>
-      ) : null}
-
       {/* KPI Cards */}
       <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-10">
         <div className="p-6 bg-gray-100 rounded-lg shadow">
@@ -224,6 +322,11 @@ export default async function AdminOverview({
             {formatUSD(stats.kpis.platformRevenue)}
           </p>
           <p className="text-xs text-gray-600 mt-1">Service fee + commission</p>
+          {fallbackInfo.applied && (
+            <p className="text-xs text-gray-500 mt-1">
+              Using fallback {fallbackInfo.bps} bps on gross.
+            </p>
+          )}
         </div>
         <div className="p-6 bg-gray-100 rounded-lg shadow">
           <h2 className="text-lg font-semibold mb-2 text-gray-900">Active Merchants</h2>
@@ -242,6 +345,63 @@ export default async function AdminOverview({
         </div>
       </section>
 
+      {/* Debug breakdown (only if ?debug=1) */}
+      {debug && (
+        <section className="mb-10">
+          <h2 className="text-xl font-semibold mb-3 text-gray-900">Debug: Orders Breakdown</h2>
+          <div className="overflow-auto border border-gray-200 rounded">
+            <table className="min-w-full text-sm text-gray-900">
+              <thead className="bg-gray-50 sticky top-0 z-10">
+                <tr className="text-left">
+                  <Th>Order ID</Th>
+                  <Th>Timestamp</</Th>
+                  <Th>Amount → Key (raw)</Th>
+                  <Th>Service Fee → Key (raw)</Th>
+                  <Th>Commission → Key (raw)</Th>
+                </tr>
+              </thead>
+              <tbody className="[&>tr:nth-child(even)]:bg-gray-50">
+                {traces.map((t) => (
+                  <tr key={`${t.id}-${t.ts ?? "na"}`} className="hover:bg-gray-100">
+                    <Td>
+                      <div className="font-medium">{t.id}</div>
+                      <div className="text-xs text-gray-600">
+                        {t.ts ? new Date(t.ts).toLocaleString() : "—"}
+                      </div>
+                    </Td>
+                    <Td>{t.ts ? new Date(t.ts).toLocaleString() : "—"}</Td>
+                    <Td>
+                      <div className="font-mono">{formatUSD(t.amount)}</div>
+                      <div className="text-xs text-gray-600">
+                        {t.amountKey ?? "—"}
+                        {t.amountRaw != null ? ` (raw=${t.amountRaw}${t.amountCents ? " cents" : ""})` : ""}
+                      </div>
+                    </Td>
+                    <Td>
+                      <div className="font-mono">{formatUSD(t.serviceFee)}</div>
+                      <div className="text-xs text-gray-600">
+                        {t.serviceKey ?? "—"}
+                        {t.serviceRaw != null ? ` (raw=${t.serviceRaw}${t.serviceCents ? " cents" : ""})` : ""}
+                      </div>
+                    </Td>
+                    <Td>
+                      <div className="font-mono">{formatUSD(t.commission)}</div>
+                      <div className="text-xs text-gray-600">
+                        {t.commissionKey ?? "—"}
+                        {t.commissionRaw != null ? ` (raw=${t.commissionRaw}${t.commissionCents ? " cents" : ""})` : ""}
+                      </div>
+                    </Td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-3 text-xs text-gray-600">
+            Set <code>ADMIN_PLATFORM_FEE_BPS</code> in your env to enable fallback platform revenue when explicit fee fields are missing.
+          </p>
+        </section>
+      )}
+
       {/* Recent Activity (to be wired next) */}
       <section>
         <h2 className="text-xl font-semibold mb-4 text-gray-900">Recent Activity</h2>
@@ -253,4 +413,16 @@ export default async function AdminOverview({
       </section>
     </main>
   );
+}
+
+function Th({ children }: { children: React.ReactNode }) {
+  return (
+    <th className="px-4 py-3 border-b border-gray-200 text-xs font-semibold uppercase tracking-wide">
+      {children}
+    </th>
+  );
+}
+
+function Td({ children }: { children: React.ReactNode }) {
+  return <td className="px-4 py-3 border-b border-gray-200 align-top">{children}</td>;
 }
