@@ -11,7 +11,7 @@ function titleCase(s: string) {
       .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
       .join(" ");
   } catch {
-    return s;
+    return s as string;
   }
 }
 
@@ -22,26 +22,59 @@ function formatDate(d: string | Date | null | undefined) {
   return dt.toLocaleString();
 }
 
-function badge(text: string, tone: "green" | "yellow" | "red" | "gray" = "gray") {
-  const tones: Record<typeof tone, string> = {
+/**
+ * Higher-contrast pill badges
+ * - darker text colors
+ * - subtle ring for separation
+ * - slightly larger/semibold text for readability
+ */
+function Badge({
+  tone = "gray",
+  children,
+}: {
+  tone?: "green" | "yellow" | "red" | "gray" | "blue";
+  children: React.ReactNode;
+}) {
+  const tones: Record<
+    NonNullable<Parameters<typeof Badge>[0]["tone"]>,
+    string
+  > = {
     green:
-      "bg-green-100 text-green-800 ring-1 ring-inset ring-green-200 dark:bg-green-900/20 dark:text-green-300",
+      // bg green-50, dark text green-700, clear ring for light/dark
+      "bg-green-50 text-green-700 ring-1 ring-inset ring-green-300 dark:bg-green-900/20 dark:text-green-200 dark:ring-green-700/60",
     yellow:
-      "bg-yellow-100 text-yellow-800 ring-1 ring-inset ring-yellow-200 dark:bg-yellow-900/20 dark:text-yellow-300",
+      "bg-yellow-50 text-yellow-800 ring-1 ring-inset ring-yellow-300 dark:bg-yellow-900/20 dark:text-yellow-200 dark:ring-yellow-700/60",
     red:
-      "bg-red-100 text-red-800 ring-1 ring-inset ring-red-200 dark:bg-red-900/20 dark:text-red-300",
+      "bg-red-50 text-red-700 ring-1 ring-inset ring-red-300 dark:bg-red-900/20 dark:text-red-200 dark:ring-red-700/60",
     gray:
-      "bg-gray-100 text-gray-800 ring-1 ring-inset ring-gray-200 dark:bg-gray-900/20 dark:text-gray-300",
+      "bg-gray-100 text-gray-800 ring-1 ring-inset ring-gray-300 dark:bg-gray-800 dark:text-gray-100 dark:ring-gray-700/80",
+    blue:
+      "bg-blue-50 text-blue-700 ring-1 ring-inset ring-blue-300 dark:bg-blue-900/20 dark:text-blue-200 dark:ring-blue-700/60",
   };
   return (
-    <span className={`px-2.5 py-0.5 rounded-full text-xs font-medium ${tones[tone]}`}>
-      {text}
+    <span
+      className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${tones[tone]}`}
+    >
+      {children}
     </span>
   );
 }
 
-function Cell({ children }: { children: React.ReactNode }) {
-  return <td className="px-4 py-3 border-b border-gray-200 align-middle text-gray-900">{children}</td>;
+function Cell({
+  children,
+  colSpan,
+}: {
+  children: React.ReactNode;
+  colSpan?: number;
+}) {
+  return (
+    <td
+      className="px-4 py-3 border-b border-gray-200 align-middle text-gray-900"
+      colSpan={colSpan}
+    >
+      {children}
+    </td>
+  );
 }
 function Head({ children }: { children: React.ReactNode }) {
   return (
@@ -160,7 +193,7 @@ export default async function AdminMerchants() {
             <tbody className="[&>tr:nth-child(even)]:bg-gray-50">
               {derived.length === 0 ? (
                 <tr>
-                  <Cell colSpan={6 as any}>
+                  <Cell colSpan={6}>
                     <div className="p-6 text-gray-700">No merchants found.</div>
                   </Cell>
                 </tr>
@@ -195,25 +228,29 @@ export default async function AdminMerchants() {
 
                     <Cell>
                       <div className="flex items-center gap-2">
-                        {m.isConnected
-                          ? badge("Connected", "green")
-                          : badge("Not Connected", "gray")}
-                        {m.chargesEnabled && badge("Charges", "green")}
-                        {m.payoutsEnabled && badge("Payouts", "green")}
+                        {m.isConnected ? (
+                          <Badge tone="green">Connected</Badge>
+                        ) : (
+                          <Badge tone="gray">Not Connected</Badge>
+                        )}
+                        {m.chargesEnabled && <Badge tone="blue">Charges</Badge>}
+                        {m.payoutsEnabled && <Badge tone="blue">Payouts</Badge>}
                       </div>
-                      <div className="text-xs text-gray-600 mt-1 truncate max-w-[240px]">
+                      <div className="text-xs text-gray-700 mt-1 truncate max-w-[240px]">
                         {m.stripeAccountId ?? "—"}
                       </div>
                     </Cell>
 
                     <Cell>
-                      {m.status === "Active"
-                        ? badge("Active", "green")
-                        : m.status === "Pending"
-                        ? badge("Pending", "yellow")
-                        : m.status === "Disconnected"
-                        ? badge("Disconnected", "red")
-                        : badge(m.status || "—", "gray")}
+                      {m.status === "Active" ? (
+                        <Badge tone="green">Active</Badge>
+                      ) : m.status === "Pending" ? (
+                        <Badge tone="yellow">Pending</Badge>
+                      ) : m.status === "Disconnected" ? (
+                        <Badge tone="red">Disconnected</Badge>
+                      ) : (
+                        <Badge tone="gray">{m.status || "—"}</Badge>
+                      )}
                     </Cell>
 
                     <Cell>{m.contact ?? "—"}</Cell>
