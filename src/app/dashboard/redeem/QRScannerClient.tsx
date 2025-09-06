@@ -21,9 +21,11 @@ export default function QRScannerClient() {
   const [rawText, setRawText] = React.useState<string>("");
   const [code, setCode] = React.useState<string>("");
   const [status, setStatus] = React.useState<
-    "idle" | "scanning" | "found" | "redeeming" | "success" | "error"
+    "idle" | "scanning" | "found" | "redeeming" | "success" | "error" | "perm"
   >("idle");
   const [error, setError] = React.useState<string | null>(null);
+
+  const fileInputRef = React.useRef<HTMLInputElement | null>(null);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -31,7 +33,6 @@ export default function QRScannerClient() {
     async function init() {
       try {
         const list = await BrowserMultiFormatReader.listVideoInputDevices();
-
         if (cancelled) return;
 
         // Deduplicate in case of repeated entries with blank IDs/labels.
@@ -71,6 +72,29 @@ export default function QRScannerClient() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [controls]);
 
+  function explainPermissionIssue(errMsg?: string) {
+    const isLocalhost = typeof window !== "undefined" && window.location.hostname === "localhost";
+    const isHttps = typeof window !== "undefined" && window.location.protocol === "https:";
+    const hints: string[] = [];
+
+    if (!isHttps && !isLocalhost) {
+      hints.push("Camera requires HTTPS (or localhost). Try using https:// on your dev domain.");
+    }
+    hints.push("Grant camera permission in your browser (then click Start scanning again).");
+    hints.push("Or use ‘Scan from image’ below to upload a QR screenshot/photo.");
+
+    const msg = [
+      "Unable to access the camera.",
+      errMsg ? `Details: ${errMsg}` : null,
+      "",
+      ...hints.map((h) => `• ${h}`),
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    return msg;
+  }
+
   function extractCodeFrom(text: string): string {
     // Try to parse a full URL and extract /card/:code
     try {
@@ -93,22 +117,29 @@ export default function QRScannerClient() {
     setStatus("scanning");
     setScanning(true);
 
-    const reader = new BrowserMultiFormatReader();
-    const nextControls = await reader.decodeFromVideoDevice(
-      deviceId,
-      videoRef.current,
-      (result) => {
-        if (result) {
-          const text = result.getText();
-          setRawText(text);
-          const c = extractCodeFrom(text);
-          setCode(c);
-          setStatus("found");
-          stop(); // stop scanning on first successful decode
+    try {
+      const reader = new BrowserMultiFormatReader();
+      const nextControls = await reader.decodeFromVideoDevice(
+        deviceId,
+        videoRef.current,
+        (result) => {
+          if (result) {
+            const text = result.getText();
+            setRawText(text);
+            const c = extractCodeFrom(text);
+            setCode(c);
+            setStatus("found");
+            stop(); // stop scanning on first successful decode
+          }
         }
-      }
-    );
-    setControls(nextControls);
+      );
+      setControls(nextControls);
+    } catch (e: any) {
+      // Most common: NotAllowedError (permission), NotFoundError (no camera), OverconstrainedError
+      setStatus("perm");
+      setError(explainPermissionIssue(e?.message || String(e)));
+      setScanning(false);
+    }
   }
 
   function stop() {
@@ -136,9 +167,30 @@ export default function QRScannerClient() {
     }
   }
 
+  async function onPickImage(file: File) {
+    setError(null);
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    try {
+      const reader = new BrowserMultiFormatReader();
+      const result = await reader.decodeFromImageUrl(url);
+      const text = result.getText();
+      setRawText(text);
+      const c = extractCodeFrom(text);
+      setCode(c);
+      setStatus("found");
+    } catch (e: any) {
+      setStatus("error");
+      setError(`Could not read QR from image. ${e?.message || ""}`.trim());
+    } finally {
+      URL.revokeObjectURL(url);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
   return (
     <div className="rounded-xl border p-4 grid gap-4">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <label className="text-sm text-gray-600">Camera</label>
         <select
           className="border rounded-md px-2 py-1 text-sm"
@@ -153,7 +205,7 @@ export default function QRScannerClient() {
           ) : (
             devices.map((d, idx) => (
               <option
-                key={`${d.deviceId || "unknown"}-${idx}`} // unique, stable per render
+                key={`${d.deviceId || "unknown"}-${idx}`}
                 value={d.deviceId}
               >
                 {d.label || `Camera ${idx + 1}`}
@@ -178,6 +230,24 @@ export default function QRScannerClient() {
             Stop
           </button>
         )}
+
+        {/* Image fallback */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) onPickImage(f);
+          }}
+        />
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          className="px-3 py-1.5 rounded-md border"
+        >
+          Scan from image…
+        </button>
       </div>
 
       <div className="aspect-video bg-black/5 rounded-md overflow-hidden flex items-center justify-center">
@@ -225,7 +295,7 @@ export default function QRScannerClient() {
         ) : null}
 
         {status === "error" && error ? (
-          <div className="text-sm rounded-md bg-rose-50 border border-rose-200 p-2 text-rose-800">
+          <div className="text-sm rounded-md bg-rose-50 border border-rose-200 p-2 text-rose-800 whitespace-pre-wrap">
             {error}
           </div>
         ) : null}
@@ -234,6 +304,10 @@ export default function QRScannerClient() {
           <div className="text-sm text-gray-600">Point the camera at a QR code…</div>
         ) : status === "found" ? (
           <div className="text-sm text-gray-600">Code detected. You can open or redeem.</div>
+        ) : status === "perm" && error ? (
+          <div className="text-sm rounded-md bg-amber-50 border border-amber-200 p-2 text-amber-800 whitespace-pre-wrap">
+            {error}
+          </div>
         ) : null}
       </div>
     </div>
