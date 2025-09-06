@@ -93,6 +93,11 @@ function parseRange(searchParams?: PageProps["searchParams"]): "7" | "30" | "90"
   return "30"; // default
 }
 
+function parseQuery(searchParams?: PageProps["searchParams"]): string {
+  const raw = (searchParams?.q ?? searchParams?.["q"]) as string | string[] | undefined;
+  return Array.isArray(raw) ? raw[0] ?? "" : raw ?? "";
+}
+
 async function loadRedemptions(range: "7" | "30" | "90" | "all"): Promise<RedemptionRow[]> {
   const supabase = await getAdminClient();
 
@@ -142,6 +147,8 @@ async function loadRedemptions(range: "7" | "30" | "90" | "all"): Promise<Redemp
 
 export default async function HistoryPage(props: PageProps) {
   const range = parseRange(props.searchParams);
+  const initialQuery = parseQuery(props.searchParams);
+
   let rows: RedemptionRow[] = [];
   let loadError: string | null = null;
 
@@ -159,66 +166,13 @@ export default async function HistoryPage(props: PageProps) {
         <div className="mt-4 rounded-md border border-rose-200 bg-rose-50 p-3 text-rose-800">
           Couldn’t load redemptions: {loadError}
         </div>
-      ) : rows.length === 0 ? (
-        <>
-          <HistoryClient rows={rows} range={range} />
-          <div className="mt-4 rounded-md border p-3 text-gray-600">
-            No redemptions in this range.
-          </div>
-        </>
       ) : (
-        <>
-          <HistoryClient rows={rows} range={range} />
-
-          <div className="mt-4 overflow-x-auto rounded-xl border">
-            <table className="min-w-full text-sm">
-              <thead className="bg-gray-50 text-left">
-                <tr>
-                  <th className="px-4 py-2 font-medium text-gray-600">
-                    Redeemed at
-                  </th>
-                  <th className="px-4 py-2 font-medium text-gray-600">
-                    Business
-                  </th>
-                  <th className="px-4 py-2 font-medium text-gray-600">
-                    Amount
-                  </th>
-                  <th className="px-4 py-2 font-medium text-gray-600">Code</th>
-                  <th className="px-4 py-2 font-medium text-gray-600">
-                    Redeemed by
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r) => {
-                  const amt = new Intl.NumberFormat(undefined, {
-                    style: "currency",
-                    currency: r.currency,
-                    maximumFractionDigits: 0,
-                  }).format(r.amount ?? 0);
-                  const at = new Date(r.redeemedAt).toLocaleString();
-                  return (
-                    <tr
-                      key={`${r.code}-${r.redeemedAt}`}
-                      className="border-t"
-                    >
-                      <td className="px-4 py-2">{at}</td>
-                      <td className="px-4 py-2">{r.businessName}</td>
-                      <td className="px-4 py-2">{amt}</td>
-                      <td className="px-4 py-2 font-mono">{r.code}</td>
-                      <td className="px-4 py-2">{r.redeemedBy ?? "—"}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </>
+        <HistoryClient rows={rows} range={range} initialQuery={initialQuery} />
       )}
 
       <p className="mt-3 text-xs text-gray-500">
-        Filter by date range and export CSV of up to the 100 most recent
-        redemptions in view.
+        Filter by date range, search by code/business, and export CSV of up to
+        the 100 most recent redemptions in view.
       </p>
     </div>
   );
