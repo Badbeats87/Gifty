@@ -7,39 +7,14 @@ import supabaseAdmin from "@/lib/supabaseAdminClient";
  * Body: { code: string }
  *
  * Behavior:
- *  - Finds the gift by code
- *  - If already redeemed, returns a clear message (idempotent)
- *  - Otherwise attempts RPC "redeem_gift_card(p_code text)" if present
- *    and gracefully falls back through common columns:
- *      1) redeemed_at (timestamp)
- *      2) redeemed (boolean)
- *      3) is_redeemed (boolean)
- *      4) used_at (timestamp)
- *  - Responds with normalized details: code, amount, currency, businessName, redeemedAt
+ *  - Looks up the gift by code (for display details).
+ *  - Uses public.gift_redemptions as the source of truth:
+ *      • If a row exists for this code => already redeemed (idempotent).
+ *      • Otherwise insert one row (on conflict, read existing) and return success.
+ *  - Returns normalized details: code, amount, currency, businessName, redeemedAt.
  */
 
 type Body = { code?: string };
-
-function isMissingColumn(err: any) {
-  // Handle Postgres error code + Supabase "schema cache" phrasing
-  const msg = `${err?.message || ""} ${err?.details || ""}`.toLowerCase();
-  return (
-    err?.code === "42703" || // undefined_column
-    (msg.includes("could not find") && msg.includes("column")) ||
-    msg.includes("schema cache") // Supabase specific phrasing
-  );
-}
-
-function isUndefinedFunction(err: any) {
-  const msg = `${err?.message || ""} ${err?.details || ""}`.toLowerCase();
-  // Postgres undefined_function is 42883; Supabase may say "schema cache"
-  return (
-    err?.code === "42883" ||
-    (msg.includes("function") && msg.includes("does not exist")) ||
-    msg.includes("could not find the function") ||
-    msg.includes("schema cache")
-  );
-}
 
 function normalizeCurrency(row: any): string {
   const cur =
@@ -79,13 +54,9 @@ function normalizeAmount(row: any): number {
   return 0;
 }
 
-function alreadyRedeemed(row: any): boolean {
-  if (row?.redeemed === true) return true;
-  if (row?.is_redeemed === true) return true;
-  if (row?.used === true) return true;
-  if (row?.redeemed_at) return true;
-  if (row?.used_at) return true;
-  return false;
+function isUniqueViolation(err: any) {
+  const msg = `${err?.message || ""} ${err?.details || ""}`.toLowerCase();
+  return err?.code === "23505" || msg.includes("duplicate key") || msg.includes("already exists");
 }
 
 async function findGiftByCode(code: string) {
@@ -100,93 +71,34 @@ async function findGiftByCode(code: string) {
   return data || null;
 }
 
-async function tryUpdateRedeemedAt(id: any) {
+async function getRedemptionRow(code: string) {
   const { data, error } = await supabaseAdmin
-    .from("gift_cards")
-    .update({ redeemed_at: new Date().toISOString() })
-    .eq("id", id)
+    .from("gift_redemptions")
     .select("*")
+    .eq("code", code)
     .maybeSingle();
   if (error) throw error;
-  return data;
+  return data as { code: string; redeemed_at: string } | null;
 }
 
-async function tryUpdateBoolean(id: any, col: "redeemed" | "is_redeemed" | "used") {
-  const { data, error } = await supabaseAdmin
-    .from("gift_cards")
-    .update({ [col]: true } as any)
-    .eq("id", id)
-    .select("*")
-    .maybeSingle();
-  if (error) throw error;
-  return data;
-}
-
-async function tryUpdateUsedAt(id: any) {
-  const { data, error } = await supabaseAdmin
-    .from("gift_cards")
-    .update({ used_at: new Date().toISOString() })
-    .eq("id", id)
-    .select("*")
-    .maybeSingle();
-  if (error) throw error;
-  return data;
-}
-
-async function ensureRedeemed(row: any) {
-  // 0) Try RPC first if present
+async function insertRedemption(code: string, redeemedBy: string = "dashboard") {
+  // Try insert; if conflict (already redeemed), we'll read the existing row.
   try {
-    const rpc = await supabaseAdmin.rpc("redeem_gift_card", { p_code: row.code });
-    if (rpc.error) {
-      if (!isUndefinedFunction(rpc.error)) throw rpc.error;
-      // else: missing RPC → fall through to column updates
-    } else {
-      const refreshed = await findGiftByCode(row.code);
-      return refreshed || row;
+    const { data, error } = await supabaseAdmin
+      .from("gift_redemptions")
+      .insert({ code, redeemed_by: redeemedBy })
+      .select("*")
+      .single();
+    if (error) throw error;
+    return data as { code: string; redeemed_at: string };
+  } catch (e: any) {
+    if (isUniqueViolation(e)) {
+      // Someone redeemed simultaneously — fetch existing
+      const existing = await getRedemptionRow(code);
+      if (existing) return existing;
     }
-  } catch (e: any) {
-    if (!isUndefinedFunction(e)) {
-      throw e;
-    }
-    // else: fall through
+    throw e;
   }
-
-  // 1) redeemed_at
-  try {
-    const updated = await tryUpdateRedeemedAt(row.id);
-    if (updated) return updated;
-  } catch (e: any) {
-    if (!isMissingColumn(e)) throw e;
-  }
-
-  // 2) redeemed (boolean)
-  try {
-    const updated = await tryUpdateBoolean(row.id, "redeemed");
-    if (updated) return updated;
-  } catch (e: any) {
-    if (!isMissingColumn(e)) throw e;
-  }
-
-  // 3) is_redeemed (boolean)
-  try {
-    const updated = await tryUpdateBoolean(row.id, "is_redeemed");
-    if (updated) return updated;
-  } catch (e: any) {
-    if (!isMissingColumn(e)) throw e;
-  }
-
-  // 4) used_at
-  try {
-    const updated = await tryUpdateUsedAt(row.id);
-    if (updated) return updated;
-  } catch (e: any) {
-    if (!isMissingColumn(e)) throw e;
-  }
-
-  // No known column found to mark redemption
-  throw new Error(
-    "No known redemption column found (tried: redeemed_at, redeemed, is_redeemed, used_at)."
-  );
 }
 
 async function findBusinessName(businessId: any) {
@@ -212,46 +124,47 @@ export async function POST(req: Request) {
       );
     }
 
-    const row = await findGiftByCode(code);
-    if (!row) {
+    // Lookup gift (for details)
+    const gift = await findGiftByCode(code);
+    if (!gift) {
       return NextResponse.json(
         { ok: false, error: "Gift not found for that code." },
         { status: 404 }
       );
     }
 
-    // Idempotent: already redeemed?
-    if (alreadyRedeemed(row)) {
-      const businessName = await findBusinessName(row.business_id);
-      const currency = normalizeCurrency(row);
-      const amount = normalizeAmount(row);
+    // Check if already redeemed
+    const existing = await getRedemptionRow(code);
+    const businessName =
+      (await findBusinessName(gift.business_id)) || gift.business_name || "Business";
+    const currency = normalizeCurrency(gift);
+    const amount = normalizeAmount(gift);
+
+    if (existing) {
       return NextResponse.json({
         ok: true,
         already: true,
         redeemed: {
-          code: row.code,
+          code,
           amount,
           currency,
-          businessName: businessName || row.business_name || "Business",
-          redeemedAt: row.redeemed_at || row.used_at || null,
+          businessName,
+          redeemedAt: existing.redeemed_at,
         },
       });
     }
 
-    // Attempt to redeem now
-    const updated = await ensureRedeemed(row);
-    const businessName = await findBusinessName(updated.business_id);
-    const currency = normalizeCurrency(updated);
-    const amount = normalizeAmount(updated);
+    // Insert redemption row (idempotent with PK on code)
+    const inserted = await insertRedemption(code, "dashboard");
 
     return NextResponse.json({
       ok: true,
       redeemed: {
-        code: updated.code,
+        code,
         amount,
         currency,
-        businessName: businessName || updated.business_name || "Business",
-        redeemedAt: updated.redeemed_at || updated.used_at || new Date().toISOString(),
+        businessName,
+        redeemedAt: inserted.redeemed_at,
       },
     });
   } catch (err: any) {
