@@ -1,105 +1,207 @@
 // src/app/api/redeem/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/db";
+import { NextResponse } from "next/server";
+import supabaseAdmin from "@/lib/supabaseAdminClient";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+/**
+ * POST /api/redeem
+ * Body: { code: string }
+ *
+ * Behavior:
+ *  - Finds the gift by code
+ *  - If already redeemed, returns a clear message (idempotent)
+ *  - Otherwise attempts an RPC "redeem_gift_card(p_code text)" if it exists
+ *    and falls back to a direct update setting redeemed_at = now()
+ *  - Responds with normalized details: code, amount, currency, businessName, redeemedAt
+ */
 
-type Body = {
-  code?: string;
-  business_slug?: string; // optional: ensure the code belongs to this business
-};
+type Body = { code?: string };
 
-function bad(msg: string, status = 400) {
-  return NextResponse.json({ error: msg }, { status });
+function isMissingColumn(err: any) {
+  const msg = (err?.message || "").toLowerCase();
+  return err?.code === "42703" || msg.includes("does not exist");
+}
+function isUndefinedFunction(err: any) {
+  const msg = (err?.message || "").toLowerCase();
+  // Postgres undefined_function is 42883
+  return err?.code === "42883" || msg.includes("function") && msg.includes("does not exist");
 }
 
-function normalizeCode(raw: string) {
-  // Uppercase, remove non-alphanumerics, re-group as AAAA-BBBB-CCCC
-  const upper = raw.toUpperCase();
-  const alnum = upper.replace(/[^A-Z0-9]/g, "");
-  const grouped = alnum.match(/.{1,4}/g)?.join("-") ?? alnum;
-  return grouped;
-}
-
-export async function POST(req: NextRequest) {
+function normalizeCurrency(row: any): string {
+  const cur =
+    row?.currency ??
+    row?.currency_code ??
+    row?.curr ??
+    row?.iso_currency ??
+    "USD";
   try {
-    const json = (await req.json()) as Body | undefined;
-    const raw = (json?.code || "").toString().trim();
-    if (!raw) return bad("Missing field: code");
+    return String(cur || "USD").toUpperCase();
+  } catch {
+    return "USD";
+  }
+}
 
-    const code = normalizeCode(raw);
+function normalizeAmount(row: any): number {
+  if (typeof row?.amount === "number" && Number.isFinite(row.amount)) {
+    return row.amount;
+  }
+  const minorCandidates = [
+    "amount_minor",
+    "amount_cents",
+    "value_minor",
+    "value_cents",
+    "minor_amount",
+  ];
+  for (const k of minorCandidates) {
+    const v = row?.[k];
+    if (typeof v === "number" && Number.isFinite(v)) {
+      return Math.round(v) / 100;
+    }
+  }
+  if (row?.value != null) {
+    const n = Number(row.value);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
 
-    // Try exact match first (our webhook saves codes already formatted XXX-XXXX-XXXX)
-    let { data: gift, error: selErr } = await supabaseAdmin
+function alreadyRedeemed(row: any): boolean {
+  if (row?.redeemed === true) return true;
+  if (row?.is_redeemed === true) return true;
+  if (row?.redeemed_at) return true;
+  return false;
+}
+
+async function findGiftByCode(code: string) {
+  const { data, error } = await supabaseAdmin
+    .from("gift_cards")
+    .select("*")
+    .eq("code", code)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function ensureRedeemed(row: any) {
+  // Try RPC first if present
+  try {
+    const rpc = await supabaseAdmin.rpc("redeem_gift_card", { p_code: row.code });
+    if (rpc.error && !isUndefinedFunction(rpc.error)) {
+      // A real RPC error (not "doesn't exist")
+      throw rpc.error;
+    }
+    if (!rpc.error) {
+      // RPC succeeded; try to refetch the row for latest fields
+      const refreshed = await findGiftByCode(row.code);
+      return refreshed || row;
+    }
+  } catch (e: any) {
+    if (!isUndefinedFunction(e)) {
+      throw e;
+    }
+    // fallthrough to SQL update when function is missing
+  }
+
+  // Fallback: set redeemed_at = now() if not already redeemed
+  try {
+    const { data, error } = await supabaseAdmin
       .from("gift_cards")
-      .select(
-        "id, code, status, remaining_amount_cents, initial_amount_cents, amount_cents, currency, business_slug, buyer_email, recipient_email, stripe_checkout_id, order_id, created_at"
-      )
-      .eq("code", code)
+      .update({ redeemed_at: new Date().toISOString() })
+      .eq("id", row.id)
+      .is("redeemed_at", null)
+      .select("*")
       .maybeSingle();
 
-    if (selErr) return bad(`DB error (select): ${selErr.message}`, 500);
-
-    // If not found, try case-insensitive (defensive)
-    if (!gift) {
-      const { data: gift2, error: selErr2 } = await supabaseAdmin
+    if (error) throw error;
+    return data || row;
+  } catch (e: any) {
+    // If the column doesn't exist, try a generic boolean flag
+    if (isMissingColumn(e)) {
+      const { data, error } = await supabaseAdmin
         .from("gift_cards")
-        .select(
-          "id, code, status, remaining_amount_cents, initial_amount_cents, amount_cents, currency, business_slug, buyer_email, recipient_email, stripe_checkout_id, order_id, created_at"
-        )
-        .ilike("code", code) // case-insensitive
+        .update({ redeemed: true })
+        .eq("id", row.id)
+        .eq("redeemed", false)
+        .select("*")
         .maybeSingle();
-
-      if (selErr2) return bad(`DB error (select2): ${selErr2.message}`, 500);
-      gift = gift2 ?? null;
+      if (error) throw error;
+      return data || row;
     }
+    throw e;
+  }
+}
 
-    if (!gift) {
-      // Helpful hint if the code came from an older email.
-      return bad(
-        "Gift code not found. If this code came from an older email (before we fixed storage), please create a new test purchase and use that new code."
+async function findBusinessName(businessId: any) {
+  if (businessId == null) return null;
+  const { data, error } = await supabaseAdmin
+    .from("businesses")
+    .select("name")
+    .eq("id", businessId)
+    .maybeSingle();
+  if (error) throw error;
+  return data?.name ?? null;
+}
+
+export async function POST(req: Request) {
+  try {
+    const body = (await req.json().catch(() => ({}))) as Body;
+    const code = (body.code || "").trim();
+
+    if (!code) {
+      return NextResponse.json(
+        { ok: false, error: 'Missing "code" in request body' },
+        { status: 400 }
       );
     }
 
-    if (json?.business_slug && gift.business_slug && gift.business_slug !== json.business_slug) {
-      return bad("Gift code does not belong to this business", 403);
+    const row = await findGiftByCode(code);
+    if (!row) {
+      return NextResponse.json(
+        { ok: false, error: "Gift not found for that code." },
+        { status: 404 }
+      );
     }
 
-    if (gift.status !== "issued" || (gift.remaining_amount_cents ?? 0) <= 0) {
-      return bad("Gift already redeemed or has no remaining balance", 409);
+    // If already redeemed, surface as idempotent success-ish response
+    if (alreadyRedeemed(row)) {
+      const businessName = await findBusinessName(row.business_id);
+      const currency = normalizeCurrency(row);
+      const amount = normalizeAmount(row);
+      return NextResponse.json({
+        ok: true,
+        already: true,
+        redeemed: {
+          code: row.code,
+          amount,
+          currency,
+          businessName: businessName || row.business_name || "Business",
+          redeemedAt: row.redeemed_at || null,
+        },
+      });
     }
 
-    // Full redemption (MVP): mark as redeemed and zero out remaining
-    const { error: updErr } = await supabaseAdmin
-      .from("gift_cards")
-      .update({
-        status: "redeemed",
-        remaining_amount_cents: 0,
-        // If your schema has redeemed_at, you can also set it:
-        // redeemed_at: new Date().toISOString(),
-      })
-      .eq("id", gift.id);
+    // Attempt to redeem now
+    const updated = await ensureRedeemed(row);
+    const businessName = await findBusinessName(updated.business_id);
+    const currency = normalizeCurrency(updated);
+    const amount = normalizeAmount(updated);
 
-    if (updErr) return bad(`DB error (update): ${updErr.message}`, 500);
-
-    const result = {
-      code: gift.code,
-      currency: gift.currency ?? "usd",
-      amount_cents: gift.amount_cents ?? gift.initial_amount_cents ?? 0,
-      initial_amount_cents: gift.initial_amount_cents ?? gift.amount_cents ?? 0,
-      remaining_amount_cents: 0,
-      status: "redeemed",
-      business_slug: gift.business_slug ?? null,
-      buyer_email: gift.buyer_email ?? null,
-      recipient_email: gift.recipient_email ?? null,
-      order_id: gift.order_id ?? null,
-      stripe_checkout_id: gift.stripe_checkout_id ?? null,
-      created_at: gift.created_at,
-    };
-
-    return NextResponse.json({ ok: true, gift: result }, { status: 200 });
-  } catch (e: any) {
-    return bad(e?.message || "Unexpected error", 500);
+    return NextResponse.json({
+      ok: true,
+      redeemed: {
+        code: updated.code,
+        amount,
+        currency,
+        businessName: businessName || updated.business_name || "Business",
+        redeemedAt: updated.redeemed_at || new Date().toISOString(),
+      },
+    });
+  } catch (err: any) {
+    console.error("[redeem] error", err);
+    return NextResponse.json(
+      { ok: false, error: err?.message || String(err) },
+      { status: 500 }
+    );
   }
 }

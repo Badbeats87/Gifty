@@ -7,9 +7,18 @@ import {
   IScannerControls,
 } from "@zxing/browser";
 
-type RedeemResult =
-  | { ok: true; redeemed?: any }
-  | { ok: false; error?: string };
+type RedeemOk = {
+  ok: true;
+  already?: boolean;
+  redeemed: {
+    code: string;
+    amount: number;
+    currency: string;
+    businessName: string;
+    redeemedAt: string | null;
+  };
+};
+type RedeemErr = { ok: false; error?: string };
 
 export default function QRScannerClient() {
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
@@ -27,25 +36,26 @@ export default function QRScannerClient() {
 
   const [rawText, setRawText] = React.useState<string>("");
   const [code, setCode] = React.useState<string>("");
+
   const [status, setStatus] = React.useState<
     "idle" | "scanning" | "found" | "redeeming" | "success" | "error" | "perm"
   >("idle");
   const [error, setError] = React.useState<string | null>(null);
 
-  // Basic environment check
+  const [result, setResult] = React.useState<RedeemOk | null>(null);
+
+  // Secure context check
   React.useEffect(() => {
     if (typeof window !== "undefined") {
       const isHttps = window.location.protocol === "https:";
-      const isLocal = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+      const isLocal = ["localhost", "127.0.0.1"].includes(window.location.hostname);
       setSecureOk(isHttps || isLocal);
     }
   }, []);
 
-  // List cameras (labels appear AFTER permission on many browsers)
   async function listCameras() {
     try {
       const list = await BrowserMultiFormatReader.listVideoInputDevices();
-      // Deduplicate possible blanks/duplicates from some browsers
       const seen = new Set<string>();
       const deduped = list.filter((d) => {
         const key = `${d.deviceId || "unknown"}|${d.label || ""}`;
@@ -54,8 +64,6 @@ export default function QRScannerClient() {
         return true;
       });
       setDevices(deduped);
-
-      // Prefer rear camera when available
       const back =
         deduped.find((d) =>
           /back|rear|environment/i.test(`${d.label} ${d.deviceId}`)
@@ -68,7 +76,6 @@ export default function QRScannerClient() {
 
   React.useEffect(() => {
     void listCameras();
-    // Stop the camera feed + ZXing when unmounting
     return () => {
       controls?.stop();
       tempStream?.getTracks()?.forEach((t) => t.stop());
@@ -76,7 +83,6 @@ export default function QRScannerClient() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // iOS/Safari rendering quirks
   React.useEffect(() => {
     if (videoRef.current) {
       videoRef.current.setAttribute("playsinline", "true");
@@ -89,21 +95,14 @@ export default function QRScannerClient() {
     if (!secureOk) {
       hints.push("Camera requires HTTPS (or localhost in dev). Open this page over https://");
     }
-    hints.push("Click ‘Enable camera’ to grant permission, then ‘Start scanning’. On iOS/Safari, ensure camera access is allowed for this site.");
+    hints.push("Click ‘Enable camera’ to grant permission, then ‘Start scanning’. On iOS/Safari, ensure camera access is allowed.");
     hints.push("Or use ‘Scan from image…’ to upload a QR screenshot/photo.");
-    const msg = [
-      "Unable to access the camera.",
-      errMsg ? `Details: ${errMsg}` : null,
-      "",
-      ...hints.map((h) => `• ${h}`),
-    ]
+    return ["Unable to access the camera.", errMsg ? `Details: ${errMsg}` : null, "", ...hints.map((h) => `• ${h}`)]
       .filter(Boolean)
       .join("\n");
-    return msg;
   }
 
   function extractCodeFrom(text: string): string {
-    // If it's a URL, pull /card/:code out of the path
     try {
       const u = new URL(text);
       const parts = u.pathname.split("/").filter(Boolean);
@@ -111,13 +110,10 @@ export default function QRScannerClient() {
       if (idx >= 0 && parts[idx + 1]) {
         return decodeURIComponent(parts[idx + 1]);
       }
-    } catch {
-      // not a URL
-    }
+    } catch {}
     return text.trim();
   }
 
-  // 1) Explicit permission step (user gesture)
   async function enableCamera() {
     setError(null);
     setStatus("perm");
@@ -125,17 +121,12 @@ export default function QRScannerClient() {
       if (!secureOk) throw new Error("Insecure context (http). Use https:// or localhost.");
 
       const constraints: MediaStreamConstraints = {
-        video: deviceId
-          ? { deviceId: { exact: deviceId } as any }
-          : { facingMode: { ideal: "environment" } as any },
+        video: deviceId ? { deviceId: { exact: deviceId } as any } : { facingMode: { ideal: "environment" } as any },
         audio: false,
       };
-
-      // Request permission explicitly
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       setPermReady(true);
 
-      // Attach to the <video> so the user sees it (helps iOS)
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         try {
@@ -143,8 +134,6 @@ export default function QRScannerClient() {
         } catch {}
       }
       setTempStream(stream);
-
-      // Re-list cameras (labels become available after permission)
       await listCameras();
     } catch (e: any) {
       setPermReady(false);
@@ -152,12 +141,12 @@ export default function QRScannerClient() {
     }
   }
 
-  // 2) Start ZXing decoding (now that permission is granted)
   async function start() {
     if (!deviceId || !videoRef.current) return;
     setError(null);
     setStatus("scanning");
     setScanning(true);
+    setResult(null);
 
     try {
       const reader = new BrowserMultiFormatReader();
@@ -171,7 +160,7 @@ export default function QRScannerClient() {
             const c = extractCodeFrom(text);
             setCode(c);
             setStatus("found");
-            stop(); // stop on first successful decode
+            stop();
           }
         }
       );
@@ -187,21 +176,22 @@ export default function QRScannerClient() {
     controls?.stop();
     setScanning(false);
     setStatus((prev) => (prev === "scanning" ? "idle" : prev));
-    // Keep tempStream alive so preview remains visible; it will be stopped on unmount.
   }
 
   async function redeemNow() {
     if (!code) return;
     setStatus("redeeming");
     setError(null);
+    setResult(null);
     try {
       const res = await fetch("/api/redeem", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code }),
       });
-      const data = (await res.json()) as RedeemResult;
-      if (!data.ok) throw new Error((data as any).error || "Redeem failed");
+      const data = (await res.json()) as RedeemOk | RedeemErr;
+      if (!data.ok) throw new Error((data as RedeemErr).error || "Redeem failed");
+      setResult(data as RedeemOk);
       setStatus("success");
     } catch (e: any) {
       setStatus("error");
@@ -211,12 +201,13 @@ export default function QRScannerClient() {
 
   async function onPickImage(file: File) {
     setError(null);
+    setResult(null);
     if (!file) return;
     const url = URL.createObjectURL(file);
     try {
       const reader = new BrowserMultiFormatReader();
-      const result = await reader.decodeFromImageUrl(url);
-      const text = result.getText();
+      const decoded = await reader.decodeFromImageUrl(url);
+      const text = decoded.getText();
       setRawText(text);
       const c = extractCodeFrom(text);
       setCode(c);
@@ -230,9 +221,16 @@ export default function QRScannerClient() {
     }
   }
 
+  const amountFmt =
+    result &&
+    new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: result.redeemed.currency || "USD",
+      maximumFractionDigits: 0,
+    }).format(result.redeemed.amount ?? 0);
+
   return (
     <div className="rounded-xl border p-4 grid gap-4">
-      {/* HTTPS warning */}
       {!secureOk ? (
         <div className="text-sm rounded-md bg-amber-50 border border-amber-200 p-2 text-amber-800">
           This page is not using HTTPS. Camera access requires HTTPS (or localhost in dev).
@@ -261,11 +259,7 @@ export default function QRScannerClient() {
           )}
         </select>
 
-        {/* New: explicit permission request (required for many browsers) */}
-        <button
-          onClick={enableCamera}
-          className="px-3 py-1.5 rounded-md border"
-        >
+        <button onClick={enableCamera} className="px-3 py-1.5 rounded-md border">
           Enable camera
         </button>
 
@@ -279,15 +273,11 @@ export default function QRScannerClient() {
             Start scanning
           </button>
         ) : (
-          <button
-            onClick={stop}
-            className="ml-auto px-3 py-1.5 rounded-md border"
-          >
+          <button onClick={stop} className="ml-auto px-3 py-1.5 rounded-md border">
             Stop
           </button>
         )}
 
-        {/* Image fallback */}
         <input
           ref={fileInputRef}
           type="file"
@@ -298,23 +288,14 @@ export default function QRScannerClient() {
             if (f) onPickImage(f);
           }}
         />
-        <button
-          onClick={() => fileInputRef.current?.click()}
-          className="px-3 py-1.5 rounded-md border"
-        >
+        <button onClick={() => fileInputRef.current?.click()} className="px-3 py-1.5 rounded-md border">
           Scan from image…
         </button>
       </div>
 
       <div className="aspect-video bg-black/5 rounded-md overflow-hidden flex items-center justify-center">
         {/* eslint-disable @next/next/no-img-element */}
-        <video
-          ref={videoRef}
-          className="w-full h-full object-cover"
-          muted
-          autoPlay
-          playsInline
-        />
+        <video ref={videoRef} className="w-full h-full object-cover" muted autoPlay playsInline />
       </div>
 
       <div className="grid gap-2">
@@ -326,6 +307,7 @@ export default function QRScannerClient() {
             const t = e.target.value;
             setRawText(t);
             setCode(extractCodeFrom(t));
+            setResult(null);
           }}
           placeholder="Scan a QR or paste a code/URL"
         />
@@ -335,9 +317,7 @@ export default function QRScannerClient() {
         <div className="flex gap-2">
           <a
             href={code ? `/card/${encodeURIComponent(code)}` : "#"}
-            className={`px-3 py-1.5 rounded-md border ${
-              code ? "text-blue-600 hover:bg-blue-50" : "opacity-50 pointer-events-none"
-            }`}
+            className={`px-3 py-1.5 rounded-md border ${code ? "text-blue-600 hover:bg-blue-50" : "opacity-50 pointer-events-none"}`}
           >
             Open card
           </a>
@@ -350,9 +330,25 @@ export default function QRScannerClient() {
           </button>
         </div>
 
-        {status === "success" ? (
-          <div className="text-sm rounded-md bg-emerald-50 border border-emerald-200 p-2 text-emerald-800">
-            Redeemed successfully.
+        {status === "success" && result ? (
+          <div className="rounded-md border p-3 bg-emerald-50 border-emerald-200 text-emerald-900">
+            <div className="font-medium">
+              {result.already ? "Already redeemed" : "Redeemed successfully"} ✅
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-3">
+              <div>
+                <div className="text-xs text-gray-600">Business</div>
+                <div className="font-semibold">{result.redeemed.businessName}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-600">Amount</div>
+                <div className="font-semibold">{amountFmt}</div>
+              </div>
+              <div className="col-span-2">
+                <div className="text-xs text-gray-600">Code</div>
+                <div className="font-mono">{result.redeemed.code}</div>
+              </div>
+            </div>
           </div>
         ) : null}
 
