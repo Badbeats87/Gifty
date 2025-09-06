@@ -2,25 +2,20 @@
 import { headers } from "next/headers";
 import DateFilters from "./DateFilters";
 
-/** Build the absolute origin from the current request (works in dev/prod). */
+/** Build absolute origin from the current request (works in dev/prod). */
 function getOrigin() {
-  // Prefer NEXT_PUBLIC_APP_URL if you set it (e.g., https://gifty.example.com)
   const env = process.env.NEXT_PUBLIC_APP_URL;
   if (env && /^https?:\/\//i.test(env)) return env.replace(/\/+$/, "");
-
-  // Otherwise derive from request headers (host + protocol)
   const h = headers();
   const host = h.get("x-forwarded-host") ?? h.get("host") ?? "localhost:3000";
   const proto = h.get("x-forwarded-proto") ?? "http";
   return `${proto}://${host}`;
 }
 
-async function getStats(from?: string, to?: string) {
+async function getStats(origin: string, from?: string, to?: string) {
   const qs = new URLSearchParams();
   if (from) qs.set("from", from);
   if (to) qs.set("to", to);
-
-  const origin = getOrigin();
   const url = `${origin}/api/admin/stats${qs.toString() ? `?${qs.toString()}` : ""}`;
 
   const res = await fetch(url, { cache: "no-store" });
@@ -57,13 +52,17 @@ function formatUSD(n: number) {
 export default async function AdminOverview({
   searchParams,
 }: {
-  searchParams: { from?: string; to?: string };
+  // Next.js 15: searchParams is async
+  searchParams: Promise<Record<string, string | undefined>>;
 }) {
+  const sp = await searchParams;
+  const origin = getOrigin();
+
   let stats: Awaited<ReturnType<typeof getStats>> | null = null;
   let error: string | null = null;
 
   try {
-    stats = await getStats(searchParams.from, searchParams.to);
+    stats = await getStats(origin, sp.from, sp.to);
   } catch (e: any) {
     error = e?.message ?? "Unknown error";
   }
@@ -72,7 +71,7 @@ export default async function AdminOverview({
     <main className="max-w-6xl mx-auto w-full px-6 py-8">
       <h1 className="text-3xl font-bold mb-2 text-gray-900">📊 Overview</h1>
 
-      {/* Client date controls (kept as-is for UX consistency) */}
+      {/* Client-side date controls */}
       <DateFilters />
 
       <p className="text-gray-600 mb-6">
