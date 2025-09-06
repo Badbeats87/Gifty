@@ -31,13 +31,26 @@ export default function QRScannerClient() {
     async function init() {
       try {
         const list = await BrowserMultiFormatReader.listVideoInputDevices();
+
         if (cancelled) return;
-        setDevices(list);
+
+        // Deduplicate in case of repeated entries with blank IDs/labels.
+        const seen = new Set<string>();
+        const deduped = list.filter((d) => {
+          const key = `${d.deviceId || "unknown"}|${d.label || ""}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+
+        setDevices(deduped);
+
         // Prefer a rear/back camera if available
         const back =
-          list.find((d) =>
+          deduped.find((d) =>
             /back|rear|environment/i.test(`${d.label} ${d.deviceId}`)
-          ) || list[0];
+          ) || deduped[0];
+
         setDeviceId(back?.deviceId || null);
       } catch (e: any) {
         setError(e?.message || String(e));
@@ -51,7 +64,7 @@ export default function QRScannerClient() {
   }, []);
 
   React.useEffect(() => {
-    // Stop the camera feed if we leave the page/component
+    // Stop the camera feed if we unmount
     return () => {
       controls?.stop();
     };
@@ -70,7 +83,6 @@ export default function QRScannerClient() {
     } catch {
       // not a URL — ignore
     }
-
     // Otherwise, return the raw text as-is (most QR codes will be the code string)
     return text.trim();
   }
@@ -85,7 +97,7 @@ export default function QRScannerClient() {
     const nextControls = await reader.decodeFromVideoDevice(
       deviceId,
       videoRef.current,
-      (result, err) => {
+      (result) => {
         if (result) {
           const text = result.getText();
           setRawText(text);
@@ -116,9 +128,7 @@ export default function QRScannerClient() {
         body: JSON.stringify({ code }),
       });
       const data = (await res.json()) as RedeemResult;
-      if (!data.ok) {
-        throw new Error(data.error || "Redeem failed");
-      }
+      if (!data.ok) throw new Error((data as any).error || "Redeem failed");
       setStatus("success");
     } catch (e: any) {
       setStatus("error");
@@ -136,11 +146,20 @@ export default function QRScannerClient() {
           onChange={(e) => setDeviceId(e.target.value || null)}
           disabled={scanning}
         >
-          {devices.map((d) => (
-            <option key={d.deviceId} value={d.deviceId}>
-              {d.label || d.deviceId}
+          {devices.length === 0 ? (
+            <option key="no-devices" value="">
+              No cameras found
             </option>
-          ))}
+          ) : (
+            devices.map((d, idx) => (
+              <option
+                key={`${d.deviceId || "unknown"}-${idx}`} // unique, stable per render
+                value={d.deviceId}
+              >
+                {d.label || `Camera ${idx + 1}`}
+              </option>
+            ))
+          )}
         </select>
 
         {!scanning ? (
@@ -184,7 +203,9 @@ export default function QRScannerClient() {
         <div className="flex gap-2">
           <a
             href={code ? `/card/${encodeURIComponent(code)}` : "#"}
-            className={`px-3 py-1.5 rounded-md border ${code ? "text-blue-600 hover:bg-blue-50" : "opacity-50 pointer-events-none"}`}
+            className={`px-3 py-1.5 rounded-md border ${
+              code ? "text-blue-600 hover:bg-blue-50" : "opacity-50 pointer-events-none"
+            }`}
           >
             Open card
           </a>
