@@ -1,37 +1,112 @@
-export const runtime = "nodejs"; // keep this
+// src/app/api/test-send-gift/route.ts
+import { NextResponse } from "next/server";
+import { sendGiftEmail } from "../../../lib/email";
 
-import { NextRequest, NextResponse } from "next/server";
-import { sendGiftEmail } from "@/lib/email";
+type Payload = {
+  to: string;
+  code: string;
+  amount: number;
+  currency: string;
+  businessName: string;
+  redeemUrl?: string;
+  recipientName?: string;
+  message?: string;
+  supportEmail?: string;
+};
 
-export async function POST(req: NextRequest) {
+function appUrl() {
+  return process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+}
+
+function parseNumber(n?: string | null) {
+  if (!n) return undefined;
+  const x = Number(n);
+  return Number.isFinite(x) ? x : undefined;
+}
+
+// Allow both GET (manual) and POST (programmatic)
+export async function GET(req: Request) {
+  const url = new URL(req.url);
+  const to = url.searchParams.get("to") || "";
+  const code = url.searchParams.get("code") || "ABCD-1234";
+  const amount = parseNumber(url.searchParams.get("amount")) ?? 25;
+  const currency = url.searchParams.get("currency") || "USD";
+  const businessName = url.searchParams.get("business") || "Sample Restaurant";
+  const recipientName = url.searchParams.get("name") || undefined;
+  const message = url.searchParams.get("message") || undefined;
+
+  if (!to) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error:
+          'Missing "to" email. Example: /api/test-send-gift?to=you@example.com&code=GIF-2025&amount=25&currency=USD&business=La Pupusería',
+      },
+      { status: 400 }
+    );
+  }
+
+  const redeemUrl =
+    url.searchParams.get("redeemUrl") ||
+    `${appUrl()}/card/${encodeURIComponent(code)}`;
+
   try {
-    const key = req.headers.get("x-test-key");
-    const expected = process.env.TEST_ENDPOINT_KEY;
-    if (!expected || key !== expected) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
+    const res = await sendGiftEmail(to, {
+      code,
+      amount,
+      currency,
+      businessName,
+      redeemUrl,
+      recipientName,
+      message,
+      supportEmail: "support@gifty.app",
+    });
 
-    const body = await req.json();
-    const { to, businessName, amountUsd, code, message } = body ?? {};
+    return NextResponse.json({ ok: true, result: res });
+  } catch (err: any) {
+    console.error("[test-send-gift] error", err);
+    return NextResponse.json(
+      { ok: false, error: err?.message || String(err) },
+      { status: 500 }
+    );
+  }
+}
 
-    if (!to || !businessName || typeof amountUsd !== "number" || !code) {
+export async function POST(req: Request) {
+  try {
+    const body = (await req.json()) as Payload;
+
+    if (!body?.to) {
       return NextResponse.json(
-        { error: "Missing required fields: to, businessName, amountUsd, code" },
+        { ok: false, error: 'Body must include "to" email' },
         { status: 400 }
       );
     }
 
-    const data = await sendGiftEmail({ to, businessName, amountUsd, code, message });
-    return NextResponse.json({ ok: true, data });
+    const code = body.code || "ABCD-1234";
+    const amount = body.amount ?? 25;
+    const currency = body.currency || "USD";
+    const businessName = body.businessName || "Sample Restaurant";
+    const redeemUrl =
+      body.redeemUrl || `${appUrl()}/card/${encodeURIComponent(code)}`;
+
+    const res = await sendGiftEmail(body.to, {
+      code,
+      amount,
+      currency,
+      businessName,
+      redeemUrl,
+      recipientName: body.recipientName,
+      message: body.message,
+      supportEmail: body.supportEmail || "support@gifty.app",
+    });
+
+    return NextResponse.json({ ok: true, result: res });
   } catch (err: any) {
-    // 👇 add DETAIL so we can see what's failing
-    const detail = {
-      name: err?.name,
-      message: err?.message,
-      stack: err?.stack,
-      cause: err?.cause,
-    };
-    console.error("Email send failed", detail, err); // keep server logs too
-    return NextResponse.json({ error: "send_failed", detail }, { status: 500 });
+    console.error("[test-send-gift] error", err);
+    return NextResponse.json(
+      { ok: false, error: err?.message || String(err) },
+      { status: 500 }
+    );
   }
 }
