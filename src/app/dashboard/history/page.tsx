@@ -1,169 +1,152 @@
-"use client";
+// src/app/dashboard/history/page.tsx
+import React from "react";
+import supabaseAdmin from "@/lib/supabaseAdmin";
 
-import { useEffect, useState } from "react";
-import Link from "next/link";
-import { supabaseBrowser } from "@/lib/supabase-browser";
+export const dynamic = "force-dynamic";
 
-type Redemption = {
-  id: string;
-  amount_cents: number | null;
-  created_at: string | null;
-  gift_card_id: string | null;
-  code?: string | null; // optional if we can join gift_cards
+type RedemptionRow = {
+  code: string;
+  redeemedAt: string;
+  redeemedBy: string | null;
+  businessName: string;
+  amount: number;
+  currency: string;
 };
 
-type State =
-  | { status: "loading" }
-  | { status: "ready"; items: Redemption[] }
-  | { status: "error"; message: string };
+function normalizeCurrency(row: any): string {
+  const cur =
+    row?.currency ??
+    row?.currency_code ??
+    row?.curr ??
+    row?.iso_currency ??
+    "USD";
+  return String(cur || "USD").toUpperCase();
+}
 
-export default function HistoryPage() {
-  const [state, setState] = useState<State>({ status: "loading" });
+function normalizeAmount(row: any): number {
+  if (typeof row?.amount === "number" && Number.isFinite(row.amount)) {
+    return row.amount;
+  }
+  const minorCandidates = [
+    "amount_minor",
+    "amount_cents",
+    "value_minor",
+    "value_cents",
+    "minor_amount",
+  ];
+  for (const k of minorCandidates) {
+    const v = row?.[k];
+    if (typeof v === "number" && Number.isFinite(v)) {
+      return Math.round(v) / 100;
+    }
+  }
+  if (row?.value != null) {
+    const n = Number(row.value);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
 
-  useEffect(() => {
-    let ignore = false;
+async function loadRedemptions(): Promise<RedemptionRow[]> {
+  // 1) get latest redemptions
+  const { data: redemptions, error: redErr } = await supabaseAdmin
+    .from("gift_redemptions")
+    .select("code, redeemed_at, redeemed_by")
+    .order("redeemed_at", { ascending: false })
+    .limit(100);
+  if (redErr) throw redErr;
+  if (!redemptions || redemptions.length === 0) return [];
 
-    (async () => {
-      try {
-        const supabase = supabaseBrowser();
+  // 2) fetch matching gift cards in one go
+  const codes = Array.from(new Set(redemptions.map((r) => r.code)));
+  const { data: gifts, error: giftErr } = await supabaseAdmin
+    .from("gift_cards")
+    .select("*")
+    .in("code", codes);
+  if (giftErr) throw giftErr;
 
-        // Ensure user is present (layout already gates, but keep it)
-        const { error: authErr } = await supabase.auth.getUser();
-        if (authErr) throw authErr;
+  const giftByCode = new Map<string, any>();
+  for (const g of gifts || []) giftByCode.set(g.code, g);
 
-        // Try to include the gift card code via relation if available:
-        // This requires a FK and a PostgREST relationship from redemptions -> gift_cards.
-        // If it errors, we fall back to the basic columns.
-        let items: Redemption[] = [];
-        let tryJoin = await supabase
-          .from("redemptions")
-          .select(
-            `
-            id,
-            amount_cents,
-            created_at,
-            gift_card_id,
-            gift_cards ( code )
-          `
-          )
-          .order("created_at", { ascending: false });
-
-        if (tryJoin.error) {
-          // Fallback without the join
-          const basic = await supabase
-            .from("redemptions")
-            .select("id, amount_cents, created_at, gift_card_id")
-            .order("created_at", { ascending: false });
-
-          if (basic.error) throw basic.error;
-
-          items =
-            (basic.data as any[]).map((r) => ({
-              id: r.id,
-              amount_cents: r.amount_cents ?? null,
-              created_at: r.created_at ?? null,
-              gift_card_id: r.gift_card_id ?? null,
-              code: null,
-            })) ?? [];
-        } else {
-          items =
-            (tryJoin.data as any[]).map((r) => ({
-              id: r.id,
-              amount_cents: r.amount_cents ?? null,
-              created_at: r.created_at ?? null,
-              gift_card_id: r.gift_card_id ?? null,
-              code: r.gift_cards?.code ?? null,
-            })) ?? [];
-        }
-
-        if (!ignore) {
-          setState({ status: "ready", items });
-        }
-      } catch (e: any) {
-        if (!ignore) {
-          setState({
-            status: "error",
-            message: e?.message ?? "Failed to load history.",
-          });
-        }
-      }
-    })();
-
-    return () => {
-      ignore = true;
+  // 3) join + normalize
+  const rows: RedemptionRow[] = redemptions.map((r) => {
+    const g = giftByCode.get(r.code) || {};
+    const businessName = g.business_name ?? g.business ?? "Business";
+    const amount = normalizeAmount(g);
+    const currency = normalizeCurrency(g);
+    return {
+      code: r.code,
+      redeemedAt: r.redeemed_at,
+      redeemedBy: r.redeemed_by ?? null,
+      businessName,
+      amount,
+      currency,
     };
-  }, []);
+  });
+
+  return rows;
+}
+
+export default async function HistoryPage() {
+  let rows: RedemptionRow[] = [];
+  let loadError: string | null = null;
+
+  try {
+    rows = await loadRedemptions();
+  } catch (e: any) {
+    loadError = e?.message || String(e);
+  }
 
   return (
-    <main className="mx-auto max-w-3xl p-6">
+    <div className="max-w-5xl mx-auto p-6">
       <h1 className="text-2xl font-semibold">Redemption history</h1>
 
-      {state.status === "loading" && <p className="mt-2">Loading…</p>}
-
-      {state.status === "error" && (
-        <>
-          <p className="mt-2 text-red-600">Error: {state.message}</p>
-          <p className="mt-4">
-            <Link href="/dashboard" className="underline">
-              Back to dashboard
-            </Link>
-          </p>
-        </>
+      {loadError ? (
+        <div className="mt-4 rounded-md border border-rose-200 bg-rose-50 p-3 text-rose-800">
+          Couldn’t load redemptions: {loadError}
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="mt-4 rounded-md border p-3 text-gray-600">
+          No redemptions yet.
+        </div>
+      ) : (
+        <div className="mt-6 overflow-x-auto rounded-xl border">
+          <table className="min-w-full text-sm">
+            <thead className="bg-gray-50 text-left">
+              <tr>
+                <th className="px-4 py-2 font-medium text-gray-600">Redeemed at</th>
+                <th className="px-4 py-2 font-medium text-gray-600">Business</th>
+                <th className="px-4 py-2 font-medium text-gray-600">Amount</th>
+                <th className="px-4 py-2 font-medium text-gray-600">Code</th>
+                <th className="px-4 py-2 font-medium text-gray-600">Redeemed by</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => {
+                const amt = new Intl.NumberFormat(undefined, {
+                  style: "currency",
+                  currency: r.currency,
+                  maximumFractionDigits: 0,
+                }).format(r.amount ?? 0);
+                const at = new Date(r.redeemedAt).toLocaleString();
+                return (
+                  <tr key={`${r.code}-${r.redeemedAt}`} className="border-t">
+                    <td className="px-4 py-2">{at}</td>
+                    <td className="px-4 py-2">{r.businessName}</td>
+                    <td className="px-4 py-2">{amt}</td>
+                    <td className="px-4 py-2 font-mono">{r.code}</td>
+                    <td className="px-4 py-2">{r.redeemedBy ?? "—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       )}
 
-      {state.status === "ready" && (
-        <>
-          {state.items.length === 0 ? (
-            <p className="mt-2 text-gray-600">No redemptions yet.</p>
-          ) : (
-            <ul className="mt-4 divide-y">
-              {state.items.map((r) => (
-                <li key={r.id} className="py-3">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <p className="font-medium">
-                        {r.code ? (
-                          <>
-                            Code: <span className="tabular-nums">{r.code}</span>
-                          </>
-                        ) : (
-                          <>
-                            Gift Card:{" "}
-                            <span className="tabular-nums">
-                              {r.gift_card_id ?? "—"}
-                            </span>
-                          </>
-                        )}
-                      </p>
-                      <p className="text-sm text-gray-600">
-                        {r.created_at
-                          ? new Date(r.created_at).toLocaleString()
-                          : "—"}
-                      </p>
-                    </div>
-                    <div className="text-right">
-                      <p className="font-semibold tabular-nums">
-                        {(typeof r.amount_cents === "number"
-                          ? r.amount_cents / 100
-                          : 0
-                        ).toLocaleString(undefined, {
-                          style: "currency",
-                          currency: "USD",
-                        })}
-                      </p>
-                    </div>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          )}
-          <p className="mt-6">
-            <Link href="/dashboard" className="underline">
-              Back to dashboard
-            </Link>
-          </p>
-        </>
-      )}
-    </main>
+      <p className="mt-3 text-xs text-gray-500">
+        Showing up to the 100 most recent redemptions. This list updates as new redemptions are logged.
+      </p>
+    </div>
   );
 }
