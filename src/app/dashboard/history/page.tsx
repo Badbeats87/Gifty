@@ -1,6 +1,9 @@
 // src/app/dashboard/history/page.tsx
-import React from "react";
-import supabaseAdmin from "@/lib/supabaseAdmin";
+import * as React from "react";
+
+// Some repos export a *function* `supabaseAdmin()`; others export a pre-made client as default.
+// This import handles both cases gracefully.
+import supabaseAdminDefault, { supabaseAdmin as supabaseAdminFactory } from "@/lib/supabaseAdmin";
 
 export const dynamic = "force-dynamic";
 
@@ -12,6 +15,13 @@ type RedemptionRow = {
   amount: number;
   currency: string;
 };
+
+function getAdminClient(): any {
+  // Prefer the named factory if it exists, else the default export.
+  const candidate: any = (supabaseAdminFactory as any) ?? (supabaseAdminDefault as any);
+  // If it's a function, call it to get a client; otherwise assume it's already a client.
+  return typeof candidate === "function" ? candidate() : candidate;
+}
 
 function normalizeCurrency(row: any): string {
   const cur =
@@ -48,30 +58,38 @@ function normalizeAmount(row: any): number {
 }
 
 async function loadRedemptions(): Promise<RedemptionRow[]> {
-  // 1) get latest redemptions
-  const { data: redemptions, error: redErr } = await supabaseAdmin
+  const supabase = getAdminClient();
+
+  // 1) get latest redemptions from the log table
+  const { data: redemptions, error: redErr } = await supabase
     .from("gift_redemptions")
     .select("code, redeemed_at, redeemed_by")
     .order("redeemed_at", { ascending: false })
     .limit(100);
+
   if (redErr) throw redErr;
   if (!redemptions || redemptions.length === 0) return [];
 
   // 2) fetch matching gift cards in one go
-  const codes = Array.from(new Set(redemptions.map((r) => r.code)));
-  const { data: gifts, error: giftErr } = await supabaseAdmin
+  const codes = Array.from(new Set(redemptions.map((r: any) => r.code)));
+  const { data: gifts, error: giftErr } = await supabase
     .from("gift_cards")
     .select("*")
     .in("code", codes);
+
   if (giftErr) throw giftErr;
 
   const giftByCode = new Map<string, any>();
   for (const g of gifts || []) giftByCode.set(g.code, g);
 
   // 3) join + normalize
-  const rows: RedemptionRow[] = redemptions.map((r) => {
+  const rows: RedemptionRow[] = redemptions.map((r: any) => {
     const g = giftByCode.get(r.code) || {};
-    const businessName = g.business_name ?? g.business ?? "Business";
+    const businessName =
+      g.business_name ??
+      g.business ??
+      g.merchant_name ??
+      "Business";
     const amount = normalizeAmount(g);
     const currency = normalizeCurrency(g);
     return {
