@@ -4,6 +4,8 @@ import React from "react";
 import GiftEmail, { GiftEmailProps } from "../emails/GiftEmail";
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const RESEND_FROM =
+  process.env.RESEND_FROM || "Gifty Test <onboarding@resend.dev>";
 
 if (!RESEND_API_KEY) {
   console.warn(
@@ -17,10 +19,9 @@ export async function sendGiftEmail(to: string, props: GiftEmailProps) {
   const subject = `Your Gifty for ${props.businessName} — code ${props.code}`;
 
   const result = await resend.emails.send({
-    from: "Gifty <hello@mail.gifty.app>",
+    from: RESEND_FROM,
     to,
     subject,
-    // Let Resend render the email from a React element:
     react: React.createElement(GiftEmail, props),
   });
 
