@@ -167,17 +167,15 @@ export default async function AdminOverview({
 
   // Build date range from query (YYYY-MM-DD) or default last 30d
   const range = (() => {
-    theDateFix: {
-      const def = defaultRange();
-      const fromD = parseDateOnly(sp.from);
-      const toD = parseDateOnly(sp.to);
-      if (fromD) def.from = fromD;
-      if (toD) {
-        toD.setUTCHours(23, 59, 59, 999);
-        def.to = toD;
-      }
-      return def;
+    const def = defaultRange();
+    const fromD = parseDateOnly(sp.from);
+    const toD = parseDateOnly(sp.to);
+    if (fromD) def.from = fromD;
+    if (toD) {
+      toD.setUTCHours(23, 59, 59, 999);
+      def.to = toD;
     }
+    return def;
   })();
 
   const debug = sp.debug === "1";
@@ -203,6 +201,10 @@ export default async function AdminOverview({
     commissionKey: string | null;
     commissionRaw: number | null | undefined;
     commissionCents: boolean;
+    buyer?: string | null;
+    recipient?: string | null;
+    currency?: string | null;
+    business_id?: string | null;
   };
 
   const traces: Trace[] = filteredOrders.map((o: AnyRow) => {
@@ -224,6 +226,10 @@ export default async function AdminOverview({
       commissionKey: com.key,
       commissionRaw: com.raw,
       commissionCents: com.centsApplied,
+      buyer: o.buyer_email ?? o.buyer ?? null,
+      recipient: o.recipient_email ?? o.recipient ?? null,
+      currency: o.currency ?? "usd",
+      business_id: o.business_id ?? null,
     };
   });
 
@@ -232,7 +238,6 @@ export default async function AdminOverview({
   let merchantCommission = traces.reduce((s, t) => s + t.commission, 0);
 
   // ---- Platform revenue fallback (if no explicit fees/commissions)
-  // ADMIN_PLATFORM_FEE_BPS = e.g. 500 (== 5.00%)
   const feeBpsEnv = process.env.ADMIN_PLATFORM_FEE_BPS;
   const feeBps = feeBpsEnv ? Number(feeBpsEnv) : 0;
   const haveExplicitFees =
@@ -268,7 +273,7 @@ export default async function AdminOverview({
       }).length
     : businessRows.length;
 
-  // ---- GIFT CARDS (redemption rate)
+  // ---- GIFT CARDS (redemption rate + activity)
   const { data: giftCards } = await supabase.from("gift_cards").select("*").limit(8000);
   const issuedInRange =
     (giftCards ?? []).filter((g: AnyRow) =>
@@ -287,6 +292,53 @@ export default async function AdminOverview({
   });
   const redemptionRate =
     issuedInRange.length > 0 ? redeemedInRange.length / issuedInRange.length : 0;
+
+  // ---- Activity feed (orders + redemptions) ----
+  type ActivityItem =
+    | {
+        kind: "order";
+        id: string;
+        ts: Date;
+        summary: string;
+        sub: string;
+      }
+    | {
+        kind: "redeem";
+        id: string;
+        ts: Date;
+        summary: string;
+        sub: string;
+      };
+
+  const orderItems: ActivityItem[] = traces
+    .filter((t) => t.ts)
+    .map((t) => ({
+      kind: "order" as const,
+      id: t.id,
+      ts: new Date(t.ts as string),
+      summary: `Order ${t.id.slice(0, 8)} • ${formatUSD(t.amount)}${t.currency ? ` ${String(t.currency).toUpperCase()}` : ""}`,
+      sub: [t.buyer ? `Buyer: ${t.buyer}` : "", t.recipient ? `Recipient: ${t.recipient}` : ""]
+        .filter(Boolean)
+        .join(" • "),
+    }));
+
+  const redemptionItems: ActivityItem[] = (redeemedInRange ?? []).map((g: AnyRow) => {
+    const code = g.code ? String(g.code) : String(g.id ?? "").slice(0, 8);
+    const tsRaw = g.redeemed_at ?? g.updated_at ?? g.created_at ?? null;
+    const ts = tsRaw ? new Date(tsRaw) : new Date();
+    const who = g.recipient_email ?? g.recipient ?? null;
+    return {
+      kind: "redeem" as const,
+      id: String(g.id ?? code),
+      ts,
+      summary: `Redeemed ${code}`,
+      sub: who ? `Recipient: ${who}` : "",
+    };
+  });
+
+  const activity: ActivityItem[] = [...orderItems, ...redemptionItems]
+    .sort((a, b) => b.ts.getTime() - a.ts.getTime())
+    .slice(0, 20);
 
   const stats = {
     period: { from: range.from.toISOString(), to: range.to.toISOString() },
@@ -322,7 +374,9 @@ export default async function AdminOverview({
           <p className="text-2xl font-bold text-gray-900">
             {formatUSD(stats.kpis.grossSales)}
           </p>
-          <p className="text-xs text-gray-600 mt-1">{stats.kpis.ordersCount} orders</p>
+          <p className="text-xs text-gray-600 mt-1">
+            {stats.kpis.ordersCount} orders
+          </p>
         </div>
         <div className="p-6 bg-gray-100 rounded-lg shadow">
           <h2 className="text-lg font-semibold mb-2 text-gray-900">Platform Revenue</h2>
@@ -330,6 +384,11 @@ export default async function AdminOverview({
             {formatUSD(stats.kpis.platformRevenue)}
           </p>
           <p className="text-xs text-gray-600 mt-1">Service fee + commission</p>
+          {fallbackInfo.applied && (
+            <p className="text-xs text-gray-500 mt-1">
+              Using fallback {fallbackInfo.bps} bps on gross.
+            </p>
+          )}
         </div>
         <div className="p-6 bg-gray-100 rounded-lg shadow">
           <h2 className="text-lg font-semibold mb-2 text-gray-900">Active Merchants</h2>
@@ -412,14 +471,38 @@ export default async function AdminOverview({
         </section>
       )}
 
-      {/* Recent Activity (to be wired next) */}
-      <section>
+      {/* Recent Activity */}
+      <section className="mb-16">
         <h2 className="text-xl font-semibold mb-4 text-gray-900">Recent Activity</h2>
-        <ul className="space-y-2">
-          <li className="p-4 bg-gray-50 rounded border border-gray-200 text-gray-900">
-            Coming soon — latest purchases &amp; redemptions
-          </li>
-        </ul>
+        {activity.length === 0 ? (
+          <div className="p-4 bg-gray-50 rounded border border-gray-200 text-gray-900">
+            No activity in this period.
+          </div>
+        ) : (
+          <ul className="space-y-2">
+            {activity.map((it) => (
+              <li
+                key={`${it.kind}-${it.id}-${it.ts.getTime()}`}
+                className="p-4 bg-white rounded border border-gray-200 flex items-start gap-3"
+              >
+                <div className="mt-0.5 text-lg" aria-hidden>
+                  {it.kind === "order" ? "🧾" : "✅"}
+                </div>
+                <div className="flex-1">
+                  <div className="flex flex-wrap items-center gap-x-2">
+                    <span className="font-medium text-gray-900">{it.summary}</span>
+                    <span className="text-xs text-gray-500">
+                      {it.ts.toLocaleString()}
+                    </span>
+                  </div>
+                  {it.sub ? (
+                    <div className="text-sm text-gray-700 mt-1">{it.sub}</div>
+                  ) : null}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
     </main>
   );
