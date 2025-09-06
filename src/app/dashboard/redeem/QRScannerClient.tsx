@@ -16,6 +16,7 @@ type RedeemOk = {
     currency: string;
     businessName: string;
     redeemedAt: string | null;
+    redeemedBy?: string | null;
   };
 };
 type RedeemErr = { ok: false; error?: string };
@@ -43,6 +44,7 @@ export default function QRScannerClient() {
   const [error, setError] = React.useState<string | null>(null);
 
   const [result, setResult] = React.useState<RedeemOk | null>(null);
+  const [staffEmail, setStaffEmail] = React.useState<string | null>(null);
 
   // Secure context check
   React.useEffect(() => {
@@ -51,6 +53,30 @@ export default function QRScannerClient() {
       const isLocal = ["localhost", "127.0.0.1"].includes(window.location.hostname);
       setSecureOk(isHttps || isLocal);
     }
+  }, []);
+
+  // Try to load the logged-in admin email from our session API (best-effort)
+  React.useEffect(() => {
+    let cancelled = false;
+    async function loadSessionEmail() {
+      try {
+        const res = await fetch("/api/admin/session", { cache: "no-store" });
+        const data = await res.json().catch(() => ({}));
+        const email =
+          data?.user?.email ||
+          data?.data?.user?.email ||
+          data?.email ||
+          data?.session?.user?.email ||
+          null;
+        if (!cancelled) setStaffEmail(email);
+      } catch {
+        if (!cancelled) setStaffEmail(null);
+      }
+    }
+    loadSessionEmail();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function listCameras() {
@@ -119,14 +145,12 @@ export default function QRScannerClient() {
     setStatus("perm");
     try {
       if (!secureOk) throw new Error("Insecure context (http). Use https:// or localhost.");
-
       const constraints: MediaStreamConstraints = {
         video: deviceId ? { deviceId: { exact: deviceId } as any } : { facingMode: { ideal: "environment" } as any },
         audio: false,
       };
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       setPermReady(true);
-
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         try {
@@ -187,7 +211,7 @@ export default function QRScannerClient() {
       const res = await fetch("/api/redeem", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
+        body: JSON.stringify({ code, redeemed_by: staffEmail || "dashboard" }),
       });
       const data = (await res.json()) as RedeemOk | RedeemErr;
       if (!data.ok) throw new Error((data as RedeemErr).error || "Redeem failed");
@@ -293,6 +317,10 @@ export default function QRScannerClient() {
         </button>
       </div>
 
+      <div className="text-xs text-gray-500 -mt-2">
+        Redeeming as: {staffEmail ? <span className="font-medium">{staffEmail}</span> : "unknown"}
+      </div>
+
       <div className="aspect-video bg-black/5 rounded-md overflow-hidden flex items-center justify-center">
         {/* eslint-disable @next/next/no-img-element */}
         <video ref={videoRef} className="w-full h-full object-cover" muted autoPlay playsInline />
@@ -321,6 +349,9 @@ export default function QRScannerClient() {
           >
             Open card
           </a>
+        </div>
+
+        <div className="flex gap-2">
           <button
             onClick={redeemNow}
             className="px-3 py-1.5 rounded-md bg-emerald-600 text-white disabled:opacity-50"
@@ -347,6 +378,10 @@ export default function QRScannerClient() {
               <div className="col-span-2">
                 <div className="text-xs text-gray-600">Code</div>
                 <div className="font-mono">{result.redeemed.code}</div>
+              </div>
+              <div className="col-span-2">
+                <div className="text-xs text-gray-600">Redeemed by</div>
+                <div className="font-mono">{result.redeemed.redeemedBy ?? staffEmail ?? "—"}</div>
               </div>
             </div>
           </div>

@@ -4,17 +4,13 @@ import supabaseAdmin from "@/lib/supabaseAdminClient";
 
 /**
  * POST /api/redeem
- * Body: { code: string }
+ * Body: { code: string, redeemed_by?: string }
  *
- * Behavior:
- *  - Looks up the gift by code (for display details).
- *  - Uses public.gift_redemptions as the source of truth:
- *      • If a row exists for this code => already redeemed (idempotent).
- *      • Otherwise insert one row (on conflict, read existing) and return success.
- *  - Returns normalized details: code, amount, currency, businessName, redeemedAt.
+ * Source of truth for redemption is public.gift_redemptions (one row per code).
+ * We lookup gift details from gift_cards for display.
  */
 
-type Body = { code?: string };
+type Body = { code?: string; redeemed_by?: string };
 
 function normalizeCurrency(row: any): string {
   const cur =
@@ -71,6 +67,8 @@ async function findGiftByCode(code: string) {
   return data || null;
 }
 
+type RedemptionRow = { code: string; redeemed_at: string; redeemed_by: string | null };
+
 async function getRedemptionRow(code: string) {
   const { data, error } = await supabaseAdmin
     .from("gift_redemptions")
@@ -78,27 +76,38 @@ async function getRedemptionRow(code: string) {
     .eq("code", code)
     .maybeSingle();
   if (error) throw error;
-  return data as { code: string; redeemed_at: string } | null;
+  return data as RedemptionRow | null;
 }
 
-async function insertRedemption(code: string, redeemedBy: string = "dashboard") {
-  // Try insert; if conflict (already redeemed), we'll read the existing row.
+async function insertRedemption(code: string, redeemedBy: string | null) {
   try {
     const { data, error } = await supabaseAdmin
       .from("gift_redemptions")
-      .insert({ code, redeemed_by: redeemedBy })
+      .insert({ code, redeemed_by: redeemedBy ?? null })
       .select("*")
       .single();
     if (error) throw error;
-    return data as { code: string; redeemed_at: string };
+    return data as RedemptionRow;
   } catch (e: any) {
     if (isUniqueViolation(e)) {
-      // Someone redeemed simultaneously — fetch existing
       const existing = await getRedemptionRow(code);
       if (existing) return existing;
     }
     throw e;
   }
+}
+
+async function backfillRedeemedByIfMissing(code: string, redeemedBy: string) {
+  if (!redeemedBy) return null;
+  const { data, error } = await supabaseAdmin
+    .from("gift_redemptions")
+    .update({ redeemed_by: redeemedBy })
+    .eq("code", code)
+    .is("redeemed_by", null)
+    .select("*")
+    .maybeSingle();
+  if (error) throw error;
+  return data as RedemptionRow | null;
 }
 
 async function findBusinessName(businessId: any) {
@@ -116,6 +125,7 @@ export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as Body;
     const code = (body.code || "").trim();
+    const redeemedBy = (body.redeemed_by || "").trim() || null;
 
     if (!code) {
       return NextResponse.json(
@@ -124,7 +134,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // Lookup gift (for details)
+    // Lookup gift (for display)
     const gift = await findGiftByCode(code);
     if (!gift) {
       return NextResponse.json(
@@ -133,14 +143,31 @@ export async function POST(req: Request) {
       );
     }
 
-    // Check if already redeemed
-    const existing = await getRedemptionRow(code);
     const businessName =
       (await findBusinessName(gift.business_id)) || gift.business_name || "Business";
     const currency = normalizeCurrency(gift);
     const amount = normalizeAmount(gift);
 
+    // If already redeemed, return idempotent response (and backfill redeemed_by if missing)
+    const existing = await getRedemptionRow(code);
     if (existing) {
+      if (!existing.redeemed_by && redeemedBy) {
+        const filled = await backfillRedeemedByIfMissing(code, redeemedBy);
+        if (filled) {
+          return NextResponse.json({
+            ok: true,
+            already: true,
+            redeemed: {
+              code,
+              amount,
+              currency,
+              businessName,
+              redeemedAt: filled.redeemed_at,
+              redeemedBy: filled.redeemed_by,
+            },
+          });
+        }
+      }
       return NextResponse.json({
         ok: true,
         already: true,
@@ -150,12 +177,13 @@ export async function POST(req: Request) {
           currency,
           businessName,
           redeemedAt: existing.redeemed_at,
+          redeemedBy: existing.redeemed_by,
         },
       });
     }
 
-    // Insert redemption row (idempotent with PK on code)
-    const inserted = await insertRedemption(code, "dashboard");
+    // Insert new redemption with redeemed_by if provided
+    const row = await insertRedemption(code, redeemedBy);
 
     return NextResponse.json({
       ok: true,
@@ -164,7 +192,8 @@ export async function POST(req: Request) {
         amount,
         currency,
         businessName,
-        redeemedAt: inserted.redeemed_at,
+        redeemedAt: row.redeemed_at,
+        redeemedBy: row.redeemed_by,
       },
     });
   } catch (err: any) {
