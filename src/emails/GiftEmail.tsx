@@ -20,7 +20,8 @@ export type GiftEmailProps = {
   currency: string;
   businessName: string;
   redeemUrl: string;
-  qrcodeSrc: string; // HTTPS URL to PNG (e.g., /api/qr?data=...)
+  /** CID (content_id) of the attached QR image, used as <img src="cid:..."> */
+  qrcodeCid: string;
   recipientName?: string;
   message?: string;
   supportEmail?: string;
@@ -33,7 +34,7 @@ export default function GiftEmail(props: GiftEmailProps) {
     currency,
     businessName,
     redeemUrl,
-    qrcodeSrc,
+    qrcodeCid,
     recipientName,
     message,
     supportEmail = "support@gifty.app",
@@ -74,15 +75,12 @@ export default function GiftEmail(props: GiftEmailProps) {
           }}
         >
           <Section style={{ padding: "24px 24px 8px 24px" }}>
-            <Heading
-              as="h2"
-              style={{ margin: 0, fontSize: 22, lineHeight: "28px" }}
-            >
+            <Heading as="h2" style={{ margin: 0, fontSize: 22, lineHeight: "28px" }}>
               You’ve received a Gifty 🎁
             </Heading>
             <Text style={{ margin: "8px 0 0 0", color: "#4b5563" }}>
-              {recipientName ? `${recipientName}, ` : ""}enjoy{" "}
-              <b>{amountFmt}</b> at <b>{businessName}</b>.
+              {recipientName ? `${recipientName}, ` : ""}enjoy <b>{amountFmt}</b> at{" "}
+              <b>{businessName}</b>.
             </Text>
           </Section>
 
@@ -97,9 +95,7 @@ export default function GiftEmail(props: GiftEmailProps) {
             }}
           >
             <div style={{ flex: 1 }}>
-              <Text style={{ margin: "0 0 4px 0", color: "#6b7280" }}>
-                Gift code
-              </Text>
+              <Text style={{ margin: "0 0 4px 0", color: "#6b7280" }}>Gift code</Text>
               <div
                 style={{
                   fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
@@ -126,7 +122,7 @@ export default function GiftEmail(props: GiftEmailProps) {
 
             <div style={{ textAlign: "center" }}>
               <Img
-                src={qrcodeSrc}
+                src={`cid:${qrcodeCid}`}
                 alt={`QR for ${code}`}
                 width="140"
                 height="140"
@@ -162,8 +158,8 @@ export default function GiftEmail(props: GiftEmailProps) {
 
           <Section style={{ padding: "16px 24px 24px 24px" }}>
             <Text style={{ margin: 0, color: "#6b7280", fontSize: 13 }}>
-              To redeem: show the code or scan the QR at the business. If you
-              need help, contact{" "}
+              To redeem: show the code or scan the QR at the business. If you need
+              help, contact{" "}
               <Link href={`mailto:${supportEmail}`} style={{ color: "#2563eb" }}>
                 {supportEmail}
               </Link>
