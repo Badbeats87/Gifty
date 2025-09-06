@@ -50,7 +50,10 @@ function toNumber(val: unknown): number | null {
 }
 
 // Heuristic: treat large integers for amount-like keys as cents.
-function normalizeAmountLike(key: string, raw: number): { value: number; centsApplied: boolean } {
+function normalizeAmountLike(
+  key: string,
+  raw: number
+): { value: number; centsApplied: boolean } {
   const k = key.toLowerCase();
   const looksLikeCentsKey =
     k.includes("cents") ||
@@ -67,7 +70,12 @@ function normalizeAmountLike(key: string, raw: number): { value: number; centsAp
   return { value: raw, centsApplied: false };
 }
 
-type PickResult = { value: number | null; key: string | null; centsApplied: boolean; raw?: number | null };
+type PickResult = {
+  value: number | null;
+  key: string | null;
+  centsApplied: boolean;
+  raw?: number | null;
+};
 
 function pickNumberWithKey(row: AnyRow, candidates: string[]): PickResult {
   for (const key of candidates) {
@@ -159,15 +167,17 @@ export default async function AdminOverview({
 
   // Build date range from query (YYYY-MM-DD) or default last 30d
   const range = (() => {
-    const def = defaultRange();
-    const fromD = parseDateOnly(sp.from);
-    const toD = parseDateOnly(sp.to);
-    if (fromD) def.from = fromD;
-    if (toD) {
-      toD.setUTCHours(23, 59, 59, 999);
-      def.to = toD;
+    theDateFix: {
+      const def = defaultRange();
+      const fromD = parseDateOnly(sp.from);
+      const toD = parseDateOnly(sp.to);
+      if (fromD) def.from = fromD;
+      if (toD) {
+        toD.setUTCHours(23, 59, 59, 999);
+        def.to = toD;
+      }
+      return def;
     }
-    return def;
   })();
 
   const debug = sp.debug === "1";
@@ -312,9 +322,7 @@ export default async function AdminOverview({
           <p className="text-2xl font-bold text-gray-900">
             {formatUSD(stats.kpis.grossSales)}
           </p>
-          <p className="text-xs text-gray-600 mt-1">
-            {stats.kpis.ordersCount} orders
-          </p>
+          <p className="text-xs text-gray-600 mt-1">{stats.kpis.ordersCount} orders</p>
         </div>
         <div className="p-6 bg-gray-100 rounded-lg shadow">
           <h2 className="text-lg font-semibold mb-2 text-gray-900">Platform Revenue</h2>
@@ -322,11 +330,6 @@ export default async function AdminOverview({
             {formatUSD(stats.kpis.platformRevenue)}
           </p>
           <p className="text-xs text-gray-600 mt-1">Service fee + commission</p>
-          {fallbackInfo.applied && (
-            <p className="text-xs text-gray-500 mt-1">
-              Using fallback {fallbackInfo.bps} bps on gross.
-            </p>
-          )}
         </div>
         <div className="p-6 bg-gray-100 rounded-lg shadow">
           <h2 className="text-lg font-semibold mb-2 text-gray-900">Active Merchants</h2>
@@ -354,7 +357,7 @@ export default async function AdminOverview({
               <thead className="bg-gray-50 sticky top-0 z-10">
                 <tr className="text-left">
                   <Th>Order ID</Th>
-                  <Th>Timestamp</</Th>
+                  <Th>Timestamp</Th>
                   <Th>Amount → Key (raw)</Th>
                   <Th>Service Fee → Key (raw)</Th>
                   <Th>Commission → Key (raw)</Th>
@@ -374,21 +377,27 @@ export default async function AdminOverview({
                       <div className="font-mono">{formatUSD(t.amount)}</div>
                       <div className="text-xs text-gray-600">
                         {t.amountKey ?? "—"}
-                        {t.amountRaw != null ? ` (raw=${t.amountRaw}${t.amountCents ? " cents" : ""})` : ""}
+                        {t.amountRaw != null
+                          ? ` (raw=${t.amountRaw}${t.amountCents ? " cents" : ""})`
+                          : ""}
                       </div>
                     </Td>
                     <Td>
                       <div className="font-mono">{formatUSD(t.serviceFee)}</div>
                       <div className="text-xs text-gray-600">
                         {t.serviceKey ?? "—"}
-                        {t.serviceRaw != null ? ` (raw=${t.serviceRaw}${t.serviceCents ? " cents" : ""})` : ""}
+                        {t.serviceRaw != null
+                          ? ` (raw=${t.serviceRaw}${t.serviceCents ? " cents" : ""})`
+                          : ""}
                       </div>
                     </Td>
                     <Td>
                       <div className="font-mono">{formatUSD(t.commission)}</div>
                       <div className="text-xs text-gray-600">
                         {t.commissionKey ?? "—"}
-                        {t.commissionRaw != null ? ` (raw=${t.commissionRaw}${t.commissionCents ? " cents" : ""})` : ""}
+                        {t.commissionRaw != null
+                          ? ` (raw=${t.commissionRaw}${t.commissionCents ? " cents" : ""})`
+                          : ""}
                       </div>
                     </Td>
                   </tr>
@@ -397,7 +406,8 @@ export default async function AdminOverview({
             </table>
           </div>
           <p className="mt-3 text-xs text-gray-600">
-            Set <code>ADMIN_PLATFORM_FEE_BPS</code> in your env to enable fallback platform revenue when explicit fee fields are missing.
+            Set <code>ADMIN_PLATFORM_FEE_BPS</code> in your env to enable fallback platform revenue
+            when explicit fee fields are missing.
           </p>
         </section>
       )}
