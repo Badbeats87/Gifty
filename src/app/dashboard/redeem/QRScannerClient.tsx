@@ -13,10 +13,17 @@ type RedeemResult =
 
 export default function QRScannerClient() {
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  const fileInputRef = React.useRef<HTMLInputElement | null>(null);
+
   const [devices, setDevices] = React.useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = React.useState<string | null>(null);
+
+  const [permReady, setPermReady] = React.useState(false);
+  const [secureOk, setSecureOk] = React.useState(true);
+
   const [scanning, setScanning] = React.useState(false);
   const [controls, setControls] = React.useState<IScannerControls | null>(null);
+  const [tempStream, setTempStream] = React.useState<MediaStream | null>(null);
 
   const [rawText, setRawText] = React.useState<string>("");
   const [code, setCode] = React.useState<string>("");
@@ -25,69 +32,65 @@ export default function QRScannerClient() {
   >("idle");
   const [error, setError] = React.useState<string | null>(null);
 
-  const fileInputRef = React.useRef<HTMLInputElement | null>(null);
-
+  // Basic environment check
   React.useEffect(() => {
-    let cancelled = false;
-
-    async function init() {
-      try {
-        const list = await BrowserMultiFormatReader.listVideoInputDevices();
-        if (cancelled) return;
-
-        // Deduplicate possible blanks/duplicates from some browsers
-        const seen = new Set<string>();
-        const deduped = list.filter((d) => {
-          const key = `${d.deviceId || "unknown"}|${d.label || ""}`;
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        });
-
-        setDevices(deduped);
-
-        // Prefer rear camera when available
-        const back =
-          deduped.find((d) =>
-            /back|rear|environment/i.test(`${d.label} ${d.deviceId}`)
-          ) || deduped[0];
-
-        setDeviceId(back?.deviceId || null);
-      } catch (e: any) {
-        setError(e?.message || String(e));
-      }
+    if (typeof window !== "undefined") {
+      const isHttps = window.location.protocol === "https:";
+      const isLocal = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+      setSecureOk(isHttps || isLocal);
     }
-
-    init();
-    return () => {
-      cancelled = true;
-    };
   }, []);
 
+  // List cameras (labels appear AFTER permission on many browsers)
+  async function listCameras() {
+    try {
+      const list = await BrowserMultiFormatReader.listVideoInputDevices();
+      // Deduplicate possible blanks/duplicates from some browsers
+      const seen = new Set<string>();
+      const deduped = list.filter((d) => {
+        const key = `${d.deviceId || "unknown"}|${d.label || ""}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      setDevices(deduped);
+
+      // Prefer rear camera when available
+      const back =
+        deduped.find((d) =>
+          /back|rear|environment/i.test(`${d.label} ${d.deviceId}`)
+        ) || deduped[0];
+      setDeviceId(back?.deviceId || null);
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    }
+  }
+
   React.useEffect(() => {
-    // Ensure iOS/Safari will actually render the stream
+    void listCameras();
+    // Stop the camera feed + ZXing when unmounting
+    return () => {
+      controls?.stop();
+      tempStream?.getTracks()?.forEach((t) => t.stop());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // iOS/Safari rendering quirks
+  React.useEffect(() => {
     if (videoRef.current) {
       videoRef.current.setAttribute("playsinline", "true");
       videoRef.current.setAttribute("muted", "true");
-      // autoPlay prop also set on element below
     }
-    return () => {
-      controls?.stop();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [controls]);
+  }, []);
 
   function explainPermissionIssue(errMsg?: string) {
-    const isLocalhost = typeof window !== "undefined" && window.location.hostname === "localhost";
-    const isHttps = typeof window !== "undefined" && window.location.protocol === "https:";
     const hints: string[] = [];
-
-    if (!isHttps && !isLocalhost) {
-      hints.push("Camera requires HTTPS (or localhost). Use https:// for your dev domain.");
+    if (!secureOk) {
+      hints.push("Camera requires HTTPS (or localhost in dev). Open this page over https://");
     }
-    hints.push("Grant camera permission in your browser, then tap Start scanning again.");
-    hints.push("Or use ‘Scan from image…’ to upload a photo/screenshot of the QR.");
-
+    hints.push("Click ‘Enable camera’ to grant permission, then ‘Start scanning’. On iOS/Safari, ensure camera access is allowed for this site.");
+    hints.push("Or use ‘Scan from image…’ to upload a QR screenshot/photo.");
     const msg = [
       "Unable to access the camera.",
       errMsg ? `Details: ${errMsg}` : null,
@@ -96,7 +99,6 @@ export default function QRScannerClient() {
     ]
       .filter(Boolean)
       .join("\n");
-
     return msg;
   }
 
@@ -115,6 +117,42 @@ export default function QRScannerClient() {
     return text.trim();
   }
 
+  // 1) Explicit permission step (user gesture)
+  async function enableCamera() {
+    setError(null);
+    setStatus("perm");
+    try {
+      if (!secureOk) throw new Error("Insecure context (http). Use https:// or localhost.");
+
+      const constraints: MediaStreamConstraints = {
+        video: deviceId
+          ? { deviceId: { exact: deviceId } as any }
+          : { facingMode: { ideal: "environment" } as any },
+        audio: false,
+      };
+
+      // Request permission explicitly
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      setPermReady(true);
+
+      // Attach to the <video> so the user sees it (helps iOS)
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        try {
+          await videoRef.current.play();
+        } catch {}
+      }
+      setTempStream(stream);
+
+      // Re-list cameras (labels become available after permission)
+      await listCameras();
+    } catch (e: any) {
+      setPermReady(false);
+      setError(explainPermissionIssue(e?.message || String(e)));
+    }
+  }
+
+  // 2) Start ZXing decoding (now that permission is granted)
   async function start() {
     if (!deviceId || !videoRef.current) return;
     setError(null);
@@ -149,6 +187,7 @@ export default function QRScannerClient() {
     controls?.stop();
     setScanning(false);
     setStatus((prev) => (prev === "scanning" ? "idle" : prev));
+    // Keep tempStream alive so preview remains visible; it will be stopped on unmount.
   }
 
   async function redeemNow() {
@@ -193,6 +232,14 @@ export default function QRScannerClient() {
 
   return (
     <div className="rounded-xl border p-4 grid gap-4">
+      {/* HTTPS warning */}
+      {!secureOk ? (
+        <div className="text-sm rounded-md bg-amber-50 border border-amber-200 p-2 text-amber-800">
+          This page is not using HTTPS. Camera access requires HTTPS (or localhost in dev).
+          Open the site via <span className="font-mono">https://</span> to use the camera.
+        </div>
+      ) : null}
+
       <div className="flex flex-wrap items-center gap-2">
         <label className="text-sm text-gray-600">Camera</label>
         <select
@@ -207,21 +254,27 @@ export default function QRScannerClient() {
             </option>
           ) : (
             devices.map((d, idx) => (
-              <option
-                key={`${d.deviceId || "unknown"}-${idx}`}
-                value={d.deviceId}
-              >
+              <option key={`${d.deviceId || "unknown"}-${idx}`} value={d.deviceId}>
                 {d.label || `Camera ${idx + 1}`}
               </option>
             ))
           )}
         </select>
 
+        {/* New: explicit permission request (required for many browsers) */}
+        <button
+          onClick={enableCamera}
+          className="px-3 py-1.5 rounded-md border"
+        >
+          Enable camera
+        </button>
+
         {!scanning ? (
           <button
             onClick={start}
             className="ml-auto px-3 py-1.5 rounded-md bg-black text-white"
-            disabled={!deviceId}
+            disabled={!permReady || !deviceId}
+            title={!permReady ? "Click ‘Enable camera’ first" : ""}
           >
             Start scanning
           </button>
