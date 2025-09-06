@@ -25,6 +25,9 @@ export default function HistoryClient({ rows, range }: Props) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
 
+  // Use a fixed locale so SSR and client render the same strings
+  const FIXED_LOCALE = "en-US";
+
   function setRange(next: "7" | "30" | "90" | "all") {
     const sp = new URLSearchParams(searchParams?.toString() || "");
     sp.set("range", next);
@@ -74,7 +77,7 @@ export default function HistoryClient({ rows, range }: Props) {
     }
   }
 
-  // Totals by currency
+  // Totals by currency (deterministic formatting)
   const totals = React.useMemo(() => {
     const map = new Map<string, number>();
     for (const r of rows) {
@@ -85,7 +88,7 @@ export default function HistoryClient({ rows, range }: Props) {
       .map(([currency, amount]) => ({
         currency,
         amount,
-        formatted: new Intl.NumberFormat(undefined, {
+        formatted: new Intl.NumberFormat(FIXED_LOCALE, {
           style: "currency",
           currency,
           maximumFractionDigits: 0,
@@ -127,6 +130,7 @@ export default function HistoryClient({ rows, range }: Props) {
               • Total{" "}
               {totals.map((t, i) => (
                 <span key={t.currency}>
+                  {/* fixed-locale formatted string to avoid hydration mismatch */}
                   <span className="font-medium">{t.formatted}</span>{" "}
                   <span className="text-gray-400">({t.currency})</span>
                   {i < totals.length - 1 ? ", " : ""}
