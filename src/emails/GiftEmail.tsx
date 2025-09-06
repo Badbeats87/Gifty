@@ -20,7 +20,7 @@ export type GiftEmailProps = {
   currency: string;
   businessName: string;
   redeemUrl: string;
-  qrcodeDataUrl: string; // data:image/png;base64,...
+  qrcodeSrc: string; // HTTPS URL to PNG (e.g., /api/qr?data=...)
   recipientName?: string;
   message?: string;
   supportEmail?: string;
@@ -33,7 +33,7 @@ export default function GiftEmail(props: GiftEmailProps) {
     currency,
     businessName,
     redeemUrl,
-    qrcodeDataUrl,
+    qrcodeSrc,
     recipientName,
     message,
     supportEmail = "support@gifty.app",
@@ -126,7 +126,7 @@ export default function GiftEmail(props: GiftEmailProps) {
 
             <div style={{ textAlign: "center" }}>
               <Img
-                src={qrcodeDataUrl}
+                src={qrcodeSrc}
                 alt={`QR for ${code}`}
                 width="140"
                 height="140"

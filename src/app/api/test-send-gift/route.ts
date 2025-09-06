@@ -1,7 +1,6 @@
 // src/app/api/test-send-gift/route.ts
 import { NextResponse } from "next/server";
 import { sendGiftEmail } from "../../../lib/email";
-import { generateQRCodeDataURL } from "../../../lib/qrcode";
 
 type Payload = {
   to: string;
@@ -25,6 +24,11 @@ function parseNumber(n?: string | null) {
   return Number.isFinite(x) ? x : undefined;
 }
 
+function qrUrlFor(redeemUrl: string) {
+  return `${appUrl()}/api/qr?data=${encodeURIComponent(redeemUrl)}&scale=6&margin=2`;
+}
+
+// Allow both GET (quick manual test) and POST (programmatic)
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const to = url.searchParams.get("to") || "";
@@ -49,17 +53,16 @@ export async function GET(req: Request) {
   const redeemUrl =
     url.searchParams.get("redeemUrl") ||
     `${appUrl()}/card/${encodeURIComponent(code)}`;
+  const qrcodeSrc = qrUrlFor(redeemUrl);
 
   try {
-    const qrcodeDataUrl = await generateQRCodeDataURL(redeemUrl);
-
     const res = await sendGiftEmail(to, {
       code,
       amount,
       currency,
       businessName,
       redeemUrl,
-      qrcodeDataUrl,
+      qrcodeSrc,
       recipientName,
       message,
       supportEmail: "support@gifty.app",
@@ -92,8 +95,7 @@ export async function POST(req: Request) {
     const businessName = body.businessName || "Sample Restaurant";
     const redeemUrl =
       body.redeemUrl || `${appUrl()}/card/${encodeURIComponent(code)}`;
-
-    const qrcodeDataUrl = await generateQRCodeDataURL(redeemUrl);
+    const qrcodeSrc = qrUrlFor(redeemUrl);
 
     const res = await sendGiftEmail(body.to, {
       code,
@@ -101,7 +103,7 @@ export async function POST(req: Request) {
       currency,
       businessName,
       redeemUrl,
-      qrcodeDataUrl,
+      qrcodeSrc,
       recipientName: body.recipientName,
       message: body.message,
       supportEmail: body.supportEmail || "support@gifty.app",
