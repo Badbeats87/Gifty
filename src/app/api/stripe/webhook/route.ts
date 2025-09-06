@@ -4,29 +4,23 @@ import { stripe } from "@/lib/stripe";
 import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 import type Stripe from "stripe";
 
-export const runtime = "nodejs"; // raw body + Stripe signature verification
+export const runtime = "nodejs";
 
 const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 
 /**
- * We support:
- * - checkout.session.completed  -> create/upsert an order
- * - payment_intent.succeeded    -> create/upsert an order (fallback if you don't use Checkout)
- * - charge.succeeded            -> update fees into existing orders (if fee columns exist)
+ * Handles:
+ * - checkout.session.completed  -> upsert order
+ * - payment_intent.succeeded    -> upsert order
+ * - charge.succeeded            -> update fees (application_fee + app-fee Stripe fee/net)
  *
- * REQUIREMENT to create an order row:
- *   metadata.business_id must be present on the Session or PaymentIntent
- *   (UUID of a row in public.businesses).
- *
- * OPTIONAL metadata we read if provided:
- *   - metadata.recipient_email
+ * We rely on metadata.business_id to satisfy NOT NULL business_id on insert.
  */
 export async function POST(req: Request) {
   if (!stripe || !WEBHOOK_SECRET) {
     return NextResponse.json({ ok: true, skipped: "Stripe not configured" });
   }
 
-  // Stripe requires raw body for signature verification
   const payload = await req.text();
   const sig = req.headers.get("stripe-signature") || "";
 
@@ -42,7 +36,6 @@ export async function POST(req: Request) {
 
   const supabase = getSupabaseAdmin();
 
-  // Store every event for traceability (optional table; if missing, we skip)
   await safeInsert(supabase, "stripe_events", {
     id: event.id,
     type: event.type,
@@ -54,8 +47,6 @@ export async function POST(req: Request) {
     switch (event.type) {
       case "checkout.session.completed": {
         const s = event.data.object as Stripe.Checkout.Session;
-
-        // Extract data for orders row
         const businessId = (s.metadata?.business_id as string | undefined) ?? null;
         const sessionId = s.id;
         const paymentIntentId =
@@ -66,7 +57,7 @@ export async function POST(req: Request) {
           s.customer_details?.email ?? (s.customer_email as string | null) ?? null;
         const recipientEmail = (s.metadata?.recipient_email as string | undefined) ?? null;
         const totalAmountCents =
-          typeof s.amount_total === "number" ? s.amount_total : null;
+          typeof s.amount_total === "number" ? s.amount_total : 0;
         const currency = (s.currency ?? "usd").toLowerCase();
 
         if (!businessId) {
@@ -77,11 +68,6 @@ export async function POST(req: Request) {
           );
           break;
         }
-        if (totalAmountCents == null) {
-          // We still create the order with 0 if Checkout total isn't present (rare),
-          // but usually amount_total is available on completed session.
-          // You can backfill later from PI/charge.
-        }
 
         await upsertOrder(supabase, {
           business_id: businessId,
@@ -89,13 +75,11 @@ export async function POST(req: Request) {
           stripe_payment_intent_id: paymentIntentId,
           buyer_email: buyerEmail,
           recipient_email: recipientEmail,
-          total_amount_cents: totalAmountCents ?? 0,
+          total_amount_cents: totalAmountCents,
           currency,
           status: "succeeded",
         });
 
-        // Also try to update fee columns based on latest charge if present
-        // (optional; no-op if your schema doesn't have fee columns)
         if (paymentIntentId) {
           await tryUpdateFeesFromPI(supabase, paymentIntentId);
         }
@@ -107,19 +91,11 @@ export async function POST(req: Request) {
 
         const businessId = (pi.metadata?.business_id as string | undefined) ?? null;
         const paymentIntentId = pi.id;
-        const sessionId =
-          typeof pi.latest_charge === "object" &&
-          (pi.latest_charge as any)?.checkout_session
-            ? ((pi.latest_charge as any).checkout_session as string)
-            : null;
         const buyerEmail =
           (pi.receipt_email as string | null) ??
-          (typeof pi.customer === "object"
-            ? (pi.customer?.email as string | null)
-            : null);
+          (typeof pi.customer === "object" ? (pi.customer?.email as string | null) : null);
         const recipientEmail = (pi.metadata?.recipient_email as string | undefined) ?? null;
-        const totalAmountCents =
-          typeof pi.amount === "number" ? pi.amount : null;
+        const totalAmountCents = typeof pi.amount === "number" ? pi.amount : 0;
         const currency = (pi.currency ?? "usd").toLowerCase();
 
         if (!businessId) {
@@ -133,27 +109,26 @@ export async function POST(req: Request) {
 
         await upsertOrder(supabase, {
           business_id: businessId,
-          stripe_checkout_session_id: sessionId,
+          stripe_checkout_session_id: null,
           stripe_payment_intent_id: paymentIntentId,
           buyer_email: buyerEmail,
           recipient_email: recipientEmail,
-          total_amount_cents: totalAmountCents ?? 0,
+          total_amount_cents: totalAmountCents,
           currency,
           status: "succeeded",
         });
 
-        // Try fee update from PI/charge (optional)
         await tryUpdateFeesFromPI(supabase, paymentIntentId);
         break;
       }
 
       case "charge.succeeded": {
-        // Keep your previous fee update behavior (optional)
         const charge = event.data.object as Stripe.Charge;
         const paymentIntentId =
           typeof charge.payment_intent === "string"
             ? charge.payment_intent
             : charge.payment_intent?.id ?? null;
+
         if (paymentIntentId) {
           await tryUpdateFeesFromPI(supabase, paymentIntentId);
         }
@@ -161,7 +136,7 @@ export async function POST(req: Request) {
       }
 
       default:
-        // ignore others for now
+        // ignore
         break;
     }
   } catch (err: any) {
@@ -182,7 +157,7 @@ async function safeInsert(
   try {
     await supabase.from(table).insert(row);
   } catch {
-    // table may not exist; ignore
+    // optional tables may not exist; ignore
   }
 }
 
@@ -199,12 +174,6 @@ async function logWebhookError(
   });
 }
 
-/**
- * Upsert strategy:
- * - If we find an existing order by `stripe_payment_intent_id` or `stripe_checkout_session_id`,
- *   we UPDATE mutable fields (emails, total, currency, status).
- * - Else we INSERT a new row (business_id is required by your schema).
- */
 async function upsertOrder(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   payload: {
@@ -220,7 +189,6 @@ async function upsertOrder(
 ) {
   const { stripe_payment_intent_id, stripe_checkout_session_id } = payload;
 
-  // Try to find existing by PI first, then by Checkout Session
   const { data: existingByPi } = stripe_payment_intent_id
     ? await supabase
         .from("orders")
@@ -242,22 +210,24 @@ async function upsertOrder(
     })());
 
   if (existing) {
-    const update: Record<string, any> = {};
-    // only set fields if they exist in your schema (they do)
-    update.stripe_payment_intent_id = payload.stripe_payment_intent_id ?? existing.stripe_payment_intent_id;
-    update.stripe_checkout_session_id = payload.stripe_checkout_session_id ?? existing.stripe_checkout_session_id;
-    update.buyer_email = payload.buyer_email ?? existing.buyer_email;
-    update.recipient_email = payload.recipient_email ?? existing.recipient_email;
-    update.currency = payload.currency ?? existing.currency;
-    update.total_amount_cents =
-      typeof payload.total_amount_cents === "number"
-        ? payload.total_amount_cents
-        : existing.total_amount_cents;
-    update.status = payload.status ?? existing.status;
-
-    await supabase.from("orders").update(update).eq("id", existing.id);
+    await supabase
+      .from("orders")
+      .update({
+        stripe_payment_intent_id:
+          payload.stripe_payment_intent_id ?? existing.stripe_payment_intent_id,
+        stripe_checkout_session_id:
+          payload.stripe_checkout_session_id ?? existing.stripe_checkout_session_id,
+        buyer_email: payload.buyer_email ?? existing.buyer_email,
+        recipient_email: payload.recipient_email ?? existing.recipient_email,
+        currency: payload.currency ?? existing.currency,
+        total_amount_cents:
+          typeof payload.total_amount_cents === "number"
+            ? payload.total_amount_cents
+            : existing.total_amount_cents,
+        status: payload.status ?? existing.status,
+      })
+      .eq("id", existing.id);
   } else {
-    // Insert new row (business_id is NOT NULL in your schema)
     await supabase.from("orders").insert({
       business_id: payload.business_id,
       stripe_payment_intent_id: payload.stripe_payment_intent_id,
@@ -272,42 +242,82 @@ async function upsertOrder(
 }
 
 /**
- * Optional: Update fee columns if your `orders` table has them.
- * We detect which columns exist by reading one row first (if any).
+ * Update per-order fee fields:
+ * - application_fee_cents (from charge.application_fee_amount)
+ * - stripe_app_fee_fee_cents (Stripe fee on our application fee)
+ * - stripe_app_fee_net_cents (application_fee_cents - stripe_app_fee_fee_cents)
  */
 async function tryUpdateFeesFromPI(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   paymentIntentId: string
 ) {
-  // Find the order by payment_intent_id
+  // Find associated order
   const { data: orders } = await supabase
     .from("orders")
     .select("*")
     .eq("stripe_payment_intent_id", paymentIntentId)
     .limit(1);
+
   const order = orders?.[0];
   if (!order) return;
 
-  // Expand latest charge to read application_fee_amount (cents)
-  let appFeeCents: number | null = null;
-  try {
-    const pi = await (await import("@/lib/stripe")).stripe.paymentIntents.retrieve(
-      paymentIntentId,
-      { expand: ["latest_charge"] }
-    );
-    const latestCharge = (pi.latest_charge as any) || null;
-    appFeeCents = latestCharge?.application_fee_amount ?? null;
-  } catch {
-    // ignore
+  // Retrieve PI with latest charge to read app fee on charge
+  const pi = await stripe.paymentIntents.retrieve(paymentIntentId, {
+    expand: ["latest_charge.balance_transaction"],
+  });
+
+  const latestCharge =
+    (typeof pi.latest_charge === "object" ? (pi.latest_charge as Stripe.Charge) : null) ||
+    null;
+
+  let applicationFeeCents: number | null = null;
+  let appFeeStripeFeeCents: number | null = null;
+  let appFeeNetCents: number | null = null;
+
+  if (latestCharge) {
+    applicationFeeCents = latestCharge.application_fee_amount ?? null;
+
+    // Get Application Fee object on the PLATFORM to see Stripe's fee & net on our app fee
+    try {
+      const fees = await stripe.applicationFees.list(
+        { charge: latestCharge.id, limit: 1 },
+        // list on the PLATFORM account (default); do not pass stripeAccount here
+      );
+      const appFee = fees.data?.[0];
+      if (appFee?.balance_transaction) {
+        const btId =
+          typeof appFee.balance_transaction === "string"
+            ? appFee.balance_transaction
+            : appFee.balance_transaction.id;
+        const bt = await stripe.balanceTransactions.retrieve(btId);
+        // bt.fee is Stripe fee in cents on the application fee; bt.net = amount - fee
+        appFeeStripeFeeCents = bt.fee ?? null;
+        appFeeNetCents = bt.net ?? null;
+      }
+    } catch {
+      // If Connect plan doesn't expose this, skip gracefully.
+    }
   }
 
-  if (appFeeCents == null) return;
-
+  // Build update only for existing columns
   const cols = Object.keys(order);
   const update: Record<string, any> = {};
-  if (cols.includes("platform_fee_cents")) update.platform_fee_cents = appFeeCents;
-  if (cols.includes("application_fee_amount")) update.application_fee_amount = appFeeCents / 100;
-  if (cols.includes("application_fee_cents")) update.application_fee_cents = appFeeCents;
+
+  if (applicationFeeCents != null && cols.includes("application_fee_cents")) {
+    update.application_fee_cents = applicationFeeCents;
+  }
+  if (appFeeStripeFeeCents != null && cols.includes("stripe_app_fee_fee_cents")) {
+    update.stripe_app_fee_fee_cents = appFeeStripeFeeCents;
+  }
+  if (appFeeNetCents != null && cols.includes("stripe_app_fee_net_cents")) {
+    update.stripe_app_fee_net_cents = appFeeNetCents;
+  } else if (
+    applicationFeeCents != null &&
+    appFeeStripeFeeCents != null &&
+    cols.includes("stripe_app_fee_net_cents")
+  ) {
+    update.stripe_app_fee_net_cents = applicationFeeCents - appFeeStripeFeeCents;
+  }
 
   if (Object.keys(update).length > 0) {
     await supabase.from("orders").update(update).eq("id", order.id);
