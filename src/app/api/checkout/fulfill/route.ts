@@ -5,6 +5,19 @@ import { sendGiftEmail } from "@/lib/email";
 
 type FulfillBody = { session_id?: string };
 
+const CANDIDATE_COLS = [
+  "session_id",
+  "stripe_session_id",
+  "order_id",
+  "stripe_checkout_session_id",
+  "checkout_session_id",
+];
+
+function isMissingColumn(err: any) {
+  const msg = (err?.message || "").toLowerCase();
+  return err?.code === "42703" || msg.includes("does not exist");
+}
+
 function appUrl() {
   return process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 }
@@ -48,23 +61,27 @@ function normalizeAmount(row: any): number {
 }
 
 async function findGiftBySession(sessionId: string) {
-  const ors = [
-    `session_id.eq.${sessionId}`,
-    `stripe_session_id.eq.${sessionId}`,
-    `order_id.eq.${sessionId}`,
-    `stripe_checkout_session_id.eq.${sessionId}`,
-  ].join(",");
+  for (const col of CANDIDATE_COLS) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from("gift_cards")
+        .select("*")
+        .eq(col, sessionId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
-  const { data, error } = await supabaseAdmin
-    .from("gift_cards")
-    .select("*") // <— do not name columns explicitly
-    .or(ors)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (error) throw error;
-  return data || null;
+      if (error) {
+        if (isMissingColumn(error)) continue;
+        throw error;
+      }
+      if (data) return data;
+    } catch (e: any) {
+      if (isMissingColumn(e)) continue;
+      throw e;
+    }
+  }
+  return null;
 }
 
 async function findBusinessName(businessId: string | number | null | undefined) {
@@ -92,7 +109,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // 1) Find the issued gift card row created by your checkout/webhook flow
     const gift = await findGiftBySession(sessionId);
 
     if (!gift) {
@@ -113,7 +129,6 @@ export async function POST(req: Request) {
     const businessName =
       (await findBusinessName(gift.business_id)) || "Your selected business";
 
-    // Choose email target
     const toEmail: string | null =
       gift.recipient_email || gift.buyer_email || gift.email || null;
 
