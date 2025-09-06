@@ -9,21 +9,28 @@ import supabaseAdmin from "@/lib/supabaseAdminClient";
  * Behavior:
  *  - Finds the gift by code
  *  - If already redeemed, returns a clear message (idempotent)
- *  - Otherwise attempts an RPC "redeem_gift_card(p_code text)" if it exists
- *    and falls back to a direct update setting redeemed_at = now()
+ *  - Otherwise attempts RPC "redeem_gift_card(p_code text)" if present
+ *    and gracefully falls back to direct updates when the function is missing.
  *  - Responds with normalized details: code, amount, currency, businessName, redeemedAt
  */
 
 type Body = { code?: string };
 
 function isMissingColumn(err: any) {
-  const msg = (err?.message || "").toLowerCase();
-  return err?.code === "42703" || msg.includes("does not exist");
+  const msg = `${err?.message || ""} ${err?.details || ""}`.toLowerCase();
+  return err?.code === "42703" || msg.includes("does not exist") && msg.includes("column");
 }
+
 function isUndefinedFunction(err: any) {
-  const msg = (err?.message || "").toLowerCase();
-  // Postgres undefined_function is 42883
-  return err?.code === "42883" || msg.includes("function") && msg.includes("does not exist");
+  const msg = `${err?.message || ""} ${err?.details || ""}`.toLowerCase();
+  // Postgres undefined_function is 42883. Supabase sometimes surfaces a
+  // friendlier message like "Could not find the function ... in the schema cache".
+  return (
+    err?.code === "42883" ||
+    msg.includes("function") && msg.includes("does not exist") ||
+    msg.includes("could not find the function") ||
+    msg.includes("schema cache")
+  );
 }
 
 function normalizeCurrency(row: any): string {
@@ -87,23 +94,26 @@ async function ensureRedeemed(row: any) {
   // Try RPC first if present
   try {
     const rpc = await supabaseAdmin.rpc("redeem_gift_card", { p_code: row.code });
-    if (rpc.error && !isUndefinedFunction(rpc.error)) {
-      // A real RPC error (not "doesn't exist")
-      throw rpc.error;
-    }
-    if (!rpc.error) {
-      // RPC succeeded; try to refetch the row for latest fields
+    if (rpc.error) {
+      if (isUndefinedFunction(rpc.error)) {
+        // Missing RPC -> fall back silently
+      } else {
+        throw rpc.error;
+      }
+    } else {
+      // RPC worked, refetch latest row
       const refreshed = await findGiftByCode(row.code);
       return refreshed || row;
     }
   } catch (e: any) {
     if (!isUndefinedFunction(e)) {
+      // Real error, not just "function missing"
       throw e;
     }
-    // fallthrough to SQL update when function is missing
+    // Else: swallow and fall through to SQL fallback
   }
 
-  // Fallback: set redeemed_at = now() if not already redeemed
+  // Fallback: set redeemed_at = now() if that column exists
   try {
     const { data, error } = await supabaseAdmin
       .from("gift_cards")
@@ -116,7 +126,7 @@ async function ensureRedeemed(row: any) {
     if (error) throw error;
     return data || row;
   } catch (e: any) {
-    // If the column doesn't exist, try a generic boolean flag
+    // If redeemed_at column doesn't exist, try a boolean flag
     if (isMissingColumn(e)) {
       const { data, error } = await supabaseAdmin
         .from("gift_cards")
@@ -181,7 +191,7 @@ export async function POST(req: Request) {
       });
     }
 
-    // Attempt to redeem now
+    // Attempt to redeem now (RPC or fallback)
     const updated = await ensureRedeemed(row);
     const businessName = await findBusinessName(updated.business_id);
     const currency = normalizeCurrency(updated);
