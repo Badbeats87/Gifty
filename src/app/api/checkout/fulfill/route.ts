@@ -3,63 +3,77 @@ import { NextResponse } from "next/server";
 import supabaseAdmin from "@/lib/supabaseAdminClient";
 import { sendGiftEmail } from "@/lib/email";
 
-/**
- * POST /api/checkout/fulfill
- * Body: { session_id: string }
- *
- * Behavior:
- *  - Finds the issued gift card for this Stripe Checkout session.
- *  - If found, sends the recipient an email with QR + link to the card page.
- *  - If not yet found (webhook/DB not finished), returns 202 so the client can retry shortly.
- *
- * Notes:
- *  - We intentionally DO NOT create any gift cards here. That should be done
- *    by your existing webhook / creation flow. We only send the email once the
- *    record exists.
- */
-
-type FulfillBody = {
-  session_id?: string;
-};
+type FulfillBody = { session_id?: string };
 
 function appUrl() {
   return process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 }
 
-// Try to locate the gift card for a given session across likely columns
+function normalizeCurrency(row: any): string {
+  const cur =
+    row?.currency ??
+    row?.currency_code ??
+    row?.curr ??
+    row?.iso_currency ??
+    "USD";
+  try {
+    return String(cur || "USD").toUpperCase();
+  } catch {
+    return "USD";
+  }
+}
+
+function normalizeAmount(row: any): number {
+  if (typeof row?.amount === "number" && Number.isFinite(row.amount)) {
+    return row.amount;
+  }
+  const minorCandidates = [
+    "amount_minor",
+    "amount_cents",
+    "value_minor",
+    "value_cents",
+    "minor_amount",
+  ];
+  for (const k of minorCandidates) {
+    const v = row?.[k];
+    if (typeof v === "number" && Number.isFinite(v)) {
+      return Math.round(v) / 100;
+    }
+  }
+  if (row?.value != null) {
+    const n = Number(row.value);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
 async function findGiftBySession(sessionId: string) {
-  // We’ll try several commonly used columns — adjust if your schema differs.
-  // gift_cards likely has one of: session_id, stripe_session_id, order_id
   const ors = [
     `session_id.eq.${sessionId}`,
     `stripe_session_id.eq.${sessionId}`,
     `order_id.eq.${sessionId}`,
+    `stripe_checkout_session_id.eq.${sessionId}`,
   ].join(",");
 
   const { data, error } = await supabaseAdmin
     .from("gift_cards")
-    .select(
-      "id, code, amount, currency, business_id, recipient_email, buyer_email, created_at"
-    )
+    .select("*") // <— do not name columns explicitly
     .or(ors)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
-  if (error) {
-    throw error;
-  }
+  if (error) throw error;
   return data || null;
 }
 
 async function findBusinessName(businessId: string | number | null | undefined) {
-  if (!businessId && businessId !== 0) return null;
+  if (businessId == null) return null;
   const { data, error } = await supabaseAdmin
     .from("businesses")
     .select("name")
     .eq("id", businessId)
     .maybeSingle();
-
   if (error) throw error;
   return data?.name ?? null;
 }
@@ -78,11 +92,10 @@ export async function POST(req: Request) {
       );
     }
 
-    // 1) Find the issued gift card (created by your existing webhook/flow)
+    // 1) Find the issued gift card row created by your checkout/webhook flow
     const gift = await findGiftBySession(sessionId);
 
     if (!gift) {
-      // Not ready yet — let the client poll again shortly
       return NextResponse.json(
         {
           ok: false,
@@ -95,19 +108,16 @@ export async function POST(req: Request) {
     }
 
     const code: string = gift.code;
-    const amount: number = Number(gift.amount ?? 0);
-    const currency: string = (gift.currency || "USD").toUpperCase();
-
-    // 2) Get business name
+    const amount: number = normalizeAmount(gift);
+    const currency: string = normalizeCurrency(gift);
     const businessName =
       (await findBusinessName(gift.business_id)) || "Your selected business";
 
-    // 3) Choose recipient: prefer recipient_email if present, otherwise fallback to buyer_email
+    // Choose email target
     const toEmail: string | null =
-      gift.recipient_email || gift.buyer_email || null;
+      gift.recipient_email || gift.buyer_email || gift.email || null;
 
     if (!toEmail) {
-      // If no email on record, don’t fail hard — let the client handle.
       return NextResponse.json(
         {
           ok: false,
@@ -120,17 +130,14 @@ export async function POST(req: Request) {
       );
     }
 
-    // 4) Build redeem URL for the real card (no test params)
     const redeemUrl = `${appUrl()}/card/${encodeURIComponent(code)}`;
 
-    // 5) Send the email (QR is embedded inside sendGiftEmail)
     const emailRes = await sendGiftEmail(toEmail, {
       code,
       amount,
       currency,
       businessName,
       redeemUrl,
-      // Optional: you can enrich later (recipientName, message, etc.)
     } as any);
 
     return NextResponse.json({
