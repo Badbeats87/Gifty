@@ -1,7 +1,7 @@
 // src/app/api/test-send-gift/route.ts
 import { NextResponse } from "next/server";
-import { sendGiftEmail } from "../../../../lib/email";
-import { generateQRCodeDataURL } from "../../../../lib/qrcode";
+import { sendGiftEmail } from "../../../lib/email";
+import { generateQRCodeDataURL } from "../../../lib/qrcode";
 
 type Payload = {
   to: string;
@@ -25,7 +25,6 @@ function parseNumber(n?: string | null) {
   return Number.isFinite(x) ? x : undefined;
 }
 
-// Allow both GET (quick manual test) and POST (programmatic)
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const to = url.searchParams.get("to") || "";
