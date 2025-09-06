@@ -24,9 +24,6 @@ function formatDate(d: string | Date | null | undefined) {
 
 /**
  * Higher-contrast pill badges
- * - darker text colors
- * - subtle ring for separation
- * - slightly larger/semibold text for readability
  */
 function Badge({
   tone = "gray",
@@ -40,7 +37,6 @@ function Badge({
     string
   > = {
     green:
-      // bg green-50, dark text green-700, clear ring for light/dark
       "bg-green-50 text-green-700 ring-1 ring-inset ring-green-300 dark:bg-green-900/20 dark:text-green-200 dark:ring-green-700/60",
     yellow:
       "bg-yellow-50 text-yellow-800 ring-1 ring-inset ring-yellow-300 dark:bg-yellow-900/20 dark:text-yellow-200 dark:ring-yellow-700/60",
@@ -100,7 +96,6 @@ export default async function AdminMerchants() {
     const name: string = b.name ?? "(Unnamed)";
     const slug: string | null = b.slug ?? null;
 
-    // Stripe connect detection
     const stripeIdCandidates = [
       b.stripe_account_id,
       b.stripe_connect_account_id,
@@ -111,11 +106,9 @@ export default async function AdminMerchants() {
     const stripeAccountId = stripeIdCandidates.find((v) => v.startsWith("acct_")) ?? null;
     const isConnected = Boolean(stripeAccountId);
 
-    // If your schema has explicit flags, prefer those
     const chargesEnabled = Boolean(b.stripe_charges_enabled ?? b.charges_enabled ?? null);
     const payoutsEnabled = Boolean(b.stripe_payouts_enabled ?? b.payouts_enabled ?? null);
 
-    // Status: prefer explicit `status` column; else infer from Stripe flags; else unknown
     let status: string = "—";
     if (typeof b.status === "string" && b.status.trim().length > 0) {
       status = titleCase(b.status);
@@ -125,7 +118,6 @@ export default async function AdminMerchants() {
       status = "Connected";
     }
 
-    // Active definition for KPI: if we have flags use them; else treat connected as active; else fall back to present row
     const isActive =
       typeof b.status === "string"
         ? b.status.toLowerCase() === "active"
@@ -143,7 +135,7 @@ export default async function AdminMerchants() {
       status,
       isActive,
       owner_user_id: b.owner_user_id ?? null,
-      contact: b.contact_email ?? b.email ?? null, // optional columns; may be null
+      contact: b.contact_email ?? b.email ?? null,
       logo_url: b.logo_url ?? null,
     };
   });
@@ -202,7 +194,6 @@ export default async function AdminMerchants() {
                   <tr key={m.id} className="hover:bg-gray-100">
                     <Cell>
                       <div className="flex items-center gap-3">
-                        {/* logo (optional) */}
                         {m.logo_url ? (
                           // eslint-disable-next-line @next/next/no-img-element
                           <img
@@ -248,6 +239,8 @@ export default async function AdminMerchants() {
                         <Badge tone="yellow">Pending</Badge>
                       ) : m.status === "Disconnected" ? (
                         <Badge tone="red">Disconnected</Badge>
+                      ) : m.status === "Connected" ? (
+                        <Badge tone="green">Connected</Badge>
                       ) : (
                         <Badge tone="gray">{m.status || "—"}</Badge>
                       )}
