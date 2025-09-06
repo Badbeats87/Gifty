@@ -25,32 +25,39 @@ if (RESEND_MODE === "prod" && !FROM_PROD) {
 
 const resend = new Resend(RESEND_API_KEY);
 
-export async function sendGiftEmail(to: string, props: Omit<GiftEmailProps, "qrcodeCid">) {
+export async function sendGiftEmail(
+  to: string,
+  props: Omit<GiftEmailProps, "qrcodeCid">
+) {
   const subject = `Your Gifty for ${props.businessName} — code ${props.code}`;
   const from = RESEND_MODE === "prod" && FROM_PROD ? FROM_PROD : FROM_TEST;
 
-  // Generate QR as a PNG buffer for the redeem URL
+  // Generate QR as PNG buffer from the redeem URL
   const qrPngBuffer = await QRCode.toBuffer(props.redeemUrl, {
     errorCorrectionLevel: "M",
     margin: 2,
     scale: 6,
     type: "png",
   });
+
+  // Resend requires base64 when sending raw content, and camelCase `contentId`
   const qrcodeCid = "gift-qr";
+  const base64Png = qrPngBuffer.toString("base64");
 
   const result = await resend.emails.send({
     from,
     to,
     subject,
-    // Embed the image inline via CID
+    // Inline image via CID; attach as base64 with contentType
     attachments: [
       {
         filename: "qr.png",
-        content: qrPngBuffer,
-        content_type: "image/png",
-        content_id: qrcodeCid,
+        content: base64Png,
+        contentType: "image/png",
+        contentId: qrcodeCid,
       },
     ],
+    // Resend will render the React email for us
     react: React.createElement(GiftEmail, { ...props, qrcodeCid }),
   });
 
